@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 
@@ -28,7 +29,10 @@ struct Params {
     [[nodiscard]] std::uint64_t period_ns() const noexcept {
         return unit_ns() * (mask + 1);
     }
+    std::uint64_t from_ns = 0, to_ns = 0;
+
     [[nodiscard]] bool in_window(std::uint64_t ts_ns) const noexcept {
+        if (from_ns < to_ns) return ts_ns >= from_ns && ts_ns < to_ns;
         return ((ts_ns >> shift) & mask) == slot;
     }
 };
@@ -38,11 +42,28 @@ struct Params {
         const char* v = std::getenv(name);
         return v == nullptr ? fallback : std::strtoull(v, nullptr, 10);
     };
+    const auto clock = [](const char* name) -> std::uint64_t {
+        const char* v = std::getenv(name);
+        if (v == nullptr) return 0;
+        unsigned h = 0, m = 0, sec = 0, ms = 0;
+        const int got = std::sscanf(v, "%u:%u:%u.%u", &h, &m, &sec, &ms);
+        if (got < 2) return 0;
+        if (got >= 4) {
+            const char* dot = std::strchr(v, '.');
+            const std::size_t digits = dot != nullptr ? std::strlen(dot + 1) : 0;
+            if (digits == 1) ms *= 100;
+            else if (digits == 2) ms *= 10;
+        }
+        return ((static_cast<std::uint64_t>(h) * 3600 + m * 60 + sec) * 1000ull + ms) *
+               1000000ull;
+    };
     Params p{get("ITCH_WINDOW_SHIFT", kDefaultShift),
              get("ITCH_WINDOW_MASK", kDefaultMask),
              get("ITCH_WINDOW_SLOT", kDefaultSlot),
              get("ITCH_WINDOW_SETTLE_MS", kDefaultSettleMs) * 1000000,
-             get("ITCH_WINDOW_TAIL_MS", kDefaultTailMs) * 1000000};
+             get("ITCH_WINDOW_TAIL_MS", kDefaultTailMs) * 1000000,
+             clock("ITCH_WINDOW_FROM"), clock("ITCH_WINDOW_TO")};
+    if (p.from_ns < p.to_ns) return p;
     const bool spacing_ok =
         p.mask == 0 ? p.settle_ns == 0 && p.tail_ns == 0
                     : p.settle_ns + p.tail_ns < p.period_ns() - p.unit_ns();
@@ -68,9 +89,9 @@ public:
     explicit Tracker(const Params& p) noexcept
         : settle_(p.settle_ns),
           tail_(p.tail_ns),
-          period_(p.period_ns()),
-          open_(p.slot * p.unit_ns()),
-          close_(open_ + p.unit_ns()) {}
+          period_(p.from_ns < p.to_ns ? ~std::uint64_t{0} / 4 : p.period_ns()),
+          open_(p.from_ns < p.to_ns ? p.from_ns : p.slot * p.unit_ns()),
+          close_(p.from_ns < p.to_ns ? p.to_ns : open_ + p.unit_ns()) {}
 
     void open_session(std::uint64_t ts_ns) noexcept { session_open_ = ts_ns; }
     void close_session(std::uint64_t ts_ns) noexcept { session_close_ = ts_ns; }

@@ -2,6 +2,11 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <thread>
+#include <vector>
+#include <cstring>
+#include <atomic>
+#include <pthread.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -23,7 +28,7 @@ constexpr int kHeaderRoom = 128;
 constexpr std::size_t kSlots = 64;
 constexpr std::size_t kSlotBytes = 2048;
 
-int listen_side(const char* ip, std::uint16_t port) {
+int listen_side(const char* ip, std::uint16_t port, bool check = false) {
     const int srv = ::socket(AF_INET, SOCK_STREAM, 0);
     int on = 1;
     ::setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
@@ -48,6 +53,68 @@ int listen_side(const char* ip, std::uint16_t port) {
     std::size_t total = 0, reads = 0;
     std::size_t msgs = 0, bad = 0, held = 0;
     unsigned char pending[4096];
+    std::size_t dropped = 0;
+    bool told = false;
+
+    constexpr std::size_t kRingBytes = 64u << 20;
+    std::vector<unsigned char> ring(kRingBytes);
+    std::atomic<std::size_t> wpos{0}, rpos{0};
+    std::atomic<bool> done{false};
+    auto show_first_bad = [&](const std::vector<unsigned char>& r_, std::size_t at,
+                              const char* why) {
+        if (told) return;
+        told = true;
+        const std::size_t from = at > 32 ? at - 32 : 0;
+        const std::size_t to = at + 32 < r_.size() ? at + 32 : r_.size();
+        std::printf("first bad at byte %zu (%s), bytes %zu..%zu:\n", at, why, from, to);
+        for (std::size_t k = from; k < to; ++k) {
+            if (k == at) std::printf(" [%02x]", r_[k]); else std::printf(" %02x", r_[k]);
+        }
+        std::printf("\n");
+        std::fflush(stdout);
+    };
+
+    std::thread checker;
+    if (check) {
+        checker = std::thread([&] {
+            for (;;) {
+                const bool ended = done.load(std::memory_order_acquire);
+                const std::size_t w = wpos.load(std::memory_order_acquire);
+                std::size_t r = rpos.load(std::memory_order_relaxed);
+                if (r == w) {
+                    if (ended) break;
+                    continue;
+                }
+                while (r < w) {
+                    if (held < sizeof(pending)) pending[held++] = ring[r];
+                    ++r;
+                    if (held < 2) continue;
+                    const std::size_t want =
+                        2 + (static_cast<std::size_t>(pending[0]) << 8) + pending[1];
+                    if (want < 4 || want > sizeof(pending)) {
+                        show_first_bad(ring, r - 1, "the length field is not a length");
+                        ++bad;
+                        held = 0;
+                        continue;
+                    }
+                    if (held < want) continue;
+                    if (pending[2] == 'U' && pending[3] == 'O') {
+                        ++msgs;
+                    } else {
+                        show_first_bad(ring, r - want, "not an order after the length");
+                        ++bad;
+                    }
+                    held = 0;
+                }
+                rpos.store(r, std::memory_order_relaxed);
+            }
+        });
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(89, &set);
+        pthread_setaffinity_np(checker.native_handle(), sizeof(set), &set);
+    }
+
     for (;;) {
         const ssize_t n = ::recv(c, buf, sizeof(buf), 0);
         if (n <= 0) break;
@@ -59,21 +126,27 @@ int listen_side(const char* ip, std::uint16_t port) {
             std::printf("\n");
         }
         ++reads;
-        for (ssize_t i = 0; i < n; ++i) {
-            if (held < sizeof(pending)) pending[held++] = static_cast<unsigned char>(buf[i]);
-            if (held < 2) continue;
-            const std::size_t want =
-                2 + (static_cast<std::size_t>(pending[0]) << 8) + pending[1];
-            if (want < 4 || want > sizeof(pending)) { ++bad; held = 0; continue; }
-            if (held < want) continue;
-            if (pending[2] == 'U' && pending[3] == 'O') ++msgs; else ++bad;
-            held = 0;
+        if (!check) continue;
+        const std::size_t w = wpos.load(std::memory_order_relaxed);
+        if (w + static_cast<std::size_t>(n) <= kRingBytes) {
+            std::memcpy(ring.data() + w, buf, static_cast<std::size_t>(n));
+            wpos.store(w + static_cast<std::size_t>(n), std::memory_order_release);
+        } else {
+            dropped += static_cast<std::size_t>(n);
         }
     }
+    done.store(true, std::memory_order_release);
+    if (checker.joinable()) checker.join();
     std::printf("%zu reads\n", reads);
     std::printf("connection closed after %zu bytes\n", total);
-    std::printf("orders received %zu, unrecognised %zu, %zu bytes left over\n",
-                msgs, bad, held);
+    if (check) {
+        std::printf("orders received %zu, unrecognised %zu, %zu bytes left over\n",
+                    msgs, bad, held);
+        if (dropped != 0) {
+            std::printf("the buffer was full, %zu bytes were dropped -"
+                        " every count above is meaningless\n", dropped);
+        }
+    }
     ::close(c);
     ::close(srv);
     return total == 0;
@@ -171,8 +244,9 @@ int send_side(const char* ip, std::uint16_t port, const char* intf) {
 
 int main(int argc, char** argv) {
     if (argc >= 4 && std::strcmp(argv[1], "--listen") == 0) {
+        const bool check = argc >= 5 && std::strcmp(argv[4], "--check") == 0;
         return listen_side(argv[2],
-                           static_cast<std::uint16_t>(std::atoi(argv[3])));
+                           static_cast<std::uint16_t>(std::atoi(argv[3])), check);
     }
     if (argc >= 5 && std::strcmp(argv[1], "--send") == 0) {
         return send_side(argv[2], static_cast<std::uint16_t>(std::atoi(argv[3])),

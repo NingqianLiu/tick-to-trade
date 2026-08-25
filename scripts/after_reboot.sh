@@ -29,6 +29,7 @@ for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
 done
 echo 0 > /proc/sys/kernel/numa_balancing
 echo 0 > /proc/sys/kernel/nmi_watchdog
+echo 0 > /proc/sys/kernel/watchdog
 echo 60 > /proc/sys/vm/stat_interval
 swapoff -a
 echo never > /sys/kernel/mm/transparent_hugepage/enabled

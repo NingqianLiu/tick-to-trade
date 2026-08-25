@@ -86,13 +86,16 @@ public:
     }
 
     [[nodiscard]] std::uint64_t top3(std::uint16_t sym, std::uint8_t s) const {
+        const Security& sec = book_[sym];
+        if (!sec.bound) return 0;
+        const bool highest = s == kBuy;
+        const Band* first = highest ? &sec.side[s].coarse : &sec.side[s].fine;
+        const Band* second = highest ? &sec.side[s].fine : &sec.side[s].coarse;
         std::uint64_t sum = 0;
-        std::uint32_t price = kNone, shares = 0;
-        for (int n = 0; n < 3; ++n) {
-            if (!step_from(sym, s, price, &price, &shares)) return 0;
-            sum += shares;
-        }
-        return sum;
+        int need = 3;
+        take(*first, highest, &need, &sum);
+        if (need != 0) take(*second, highest, &need, &sum);
+        return need == 0 ? sum : 0;
     }
 
 private:
@@ -184,6 +187,40 @@ private:
         b.w1[i >> 12] &= ~(1ull << ((i >> 6) & 63));
         if (b.w1[i >> 12] != 0) return;
         b.w2[i >> 18] &= ~(1ull << ((i >> 12) & 63));
+    }
+
+    static void take(const Band& b, bool highest, int* need, std::uint64_t* sum) {
+        if (b.len == 0) return;
+        for (std::uint32_t k2 = 0; k2 < b.n2; ++k2) {
+            const std::uint32_t i2 = highest ? b.n2 - 1 - k2 : k2;
+            if (walk1(b, highest, b.w2[i2], i2, need, sum)) return;
+        }
+    }
+
+    static bool walk1(const Band& b, bool highest, std::uint64_t m2,
+                      std::uint32_t i2, int* need, std::uint64_t* sum) {
+        while (m2 != 0) {
+            const std::uint32_t j1 = highest ? 63 - __builtin_clzll(m2)
+                                             : __builtin_ctzll(m2);
+            m2 &= ~(1ull << j1);
+            const std::uint32_t i1 = (i2 << 6) | j1;
+            std::uint64_t m1 = b.w1[i1];
+            while (m1 != 0) {
+                const std::uint32_t j0 = highest ? 63 - __builtin_clzll(m1)
+                                                 : __builtin_ctzll(m1);
+                m1 &= ~(1ull << j0);
+                const std::uint32_t i0 = (i1 << 6) | j0;
+                std::uint64_t m0 = b.w0[i0];
+                while (m0 != 0) {
+                    const std::uint32_t j = highest ? 63 - __builtin_clzll(m0)
+                                                    : __builtin_ctzll(m0);
+                    m0 &= ~(1ull << j);
+                    *sum += b.qty[(i0 << 6) | j];
+                    if (--*need == 0) return true;
+                }
+            }
+        }
+        return false;
     }
 
     static bool pick(const Band& b, bool highest, std::uint32_t from, std::uint32_t* out) {

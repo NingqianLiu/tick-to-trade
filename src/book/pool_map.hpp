@@ -55,6 +55,16 @@ public:
         return true;
     }
 
+    void ask_for_all(const std::uint64_t* oids, std::size_t n) const {
+        for (std::size_t j = 0; j < n; ++j) {
+            __builtin_prefetch(&buckets_[bucket(oids[j])], 0, 3);
+        }
+        for (std::size_t j = 0; j < n; ++j) {
+            const std::uint32_t i = buckets_[bucket(oids[j])];
+            if (i != kEnd) __builtin_prefetch(&nodes_[i], 0, 3);
+        }
+    }
+
     [[nodiscard]] bool find(std::uint64_t oid, Order* out) const {
         for (std::uint32_t i = buckets_[bucket(oid)]; i != kEnd; i = nodes_[i].next) {
             if (nodes_[i].oid == oid) {

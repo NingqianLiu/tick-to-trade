@@ -34,6 +34,11 @@ Conn opened(std::uint32_t seq = 1000) {
     return c;
 }
 
+std::uint32_t fold_of(std::uint32_t s) {
+    while (s >> 16) s = (s & 0xffff) + (s >> 16);
+    return s;
+}
+
 std::uint32_t sum_of(const std::uint8_t* p, std::size_t n) {
     std::uint32_t s = mintcp::sum16(p, n);
     while (s >> 16) s = (s & 0xffff) + (s >> 16);
@@ -171,4 +176,47 @@ TEST(MinTcp, the_payload_is_copied_in_whole) {
     EXPECT_EQ(std::memcmp(f.data() + mintcp::kHeaderLen, body.data(), body.size()), 0);
 }
 
+}
+
+TEST(MinTcp, the_handshake_packet_carries_the_window_scale_option) {
+    Conn c = opened(1000);
+    std::vector<std::uint8_t> f(200, 0xee);
+    const std::size_t n = c.send_syn(f.data(), 0);
+    EXPECT_EQ(n, mintcp::kHeaderLen + 4);
+    EXPECT_EQ(f[34 + 12] >> 4, 6u);
+    EXPECT_EQ(f[mintcp::kHeaderLen + 0], 1);
+    EXPECT_EQ(f[mintcp::kHeaderLen + 1], 3);
+    EXPECT_EQ(f[mintcp::kHeaderLen + 2], 3);
+    EXPECT_EQ(f[mintcp::kHeaderLen + 3], 0);
+    EXPECT_EQ(mintcp::get16(f.data() + 16), mintcp::kIpLen + mintcp::kTcpLen + 4);
+    EXPECT_EQ(sum_of(f.data() + 14, mintcp::kIpLen), 0xffffu);
+    const std::uint32_t pseudo =
+        (eth::ipv4(10, 9, 9, 2) >> 16) + (eth::ipv4(10, 9, 9, 2) & 0xffff) +
+        (eth::ipv4(10, 9, 9, 1) >> 16) + (eth::ipv4(10, 9, 9, 1) & 0xffff) + 6u +
+        (mintcp::kTcpLen + 4);
+    EXPECT_EQ(fold_of(pseudo + mintcp::sum16(f.data() + 34, mintcp::kTcpLen + 4)),
+              0xffffu);
+    EXPECT_EQ(c.snd_nxt(), 1001u);
+}
+
+TEST(MinTcp, the_peer_shift_is_read_back_out_of_their_answer) {
+    std::vector<std::uint8_t> f(200, 0);
+    f[34 + 12] = 0x50;
+    EXPECT_EQ(Conn::shift_in(f.data(), mintcp::kHeaderLen), 0);
+    f[34 + 12] = 0x60;
+    f[mintcp::kHeaderLen + 0] = 1;
+    f[mintcp::kHeaderLen + 1] = 3;
+    f[mintcp::kHeaderLen + 2] = 3;
+    f[mintcp::kHeaderLen + 3] = 7;
+    EXPECT_EQ(Conn::shift_in(f.data(), mintcp::kHeaderLen + 4), 7);
+    EXPECT_EQ(Conn::shift_in(f.data(), mintcp::kHeaderLen), 0);
+}
+
+TEST(MinTcp, the_window_they_report_is_shifted_by_what_they_asked_for) {
+    Conn c = opened(1000);
+    (void)c.on_ack(1000, 65535);
+    EXPECT_EQ(c.peer_wnd(), 65535u);
+    c.set_peer_shift(7);
+    (void)c.on_ack(1000, 65535);
+    EXPECT_EQ(c.peer_wnd(), 65535u * 128u);
 }
