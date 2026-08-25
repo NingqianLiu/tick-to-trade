@@ -1,4 +1,3 @@
-
 #include "common/huge.hpp"
 
 #include <gtest/gtest.h>

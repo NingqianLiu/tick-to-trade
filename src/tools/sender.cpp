@@ -1,4 +1,3 @@
-
 #include <sched.h>
 
 #include <etherfabric/ef_vi.h>

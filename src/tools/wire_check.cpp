@@ -1,4 +1,3 @@
-
 #include <etherfabric/ef_vi.h>
 #include <etherfabric/vi.h>
 #include <netinet/in.h>

@@ -1,4 +1,3 @@
-
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
