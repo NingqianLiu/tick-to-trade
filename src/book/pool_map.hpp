@@ -13,6 +13,7 @@ public:
         std::uint32_t shares;
         std::uint32_t price;
         std::uint8_t side;
+        std::uint16_t sym;
     };
 
     explicit PoolMap(std::size_t orders) {
@@ -40,6 +41,8 @@ public:
             if (nodes_[i].oid == oid) {
                 nodes_[i].shares = o.shares;
                 nodes_[i].side_price = pack(o);
+        nodes_[i].sym = o.sym;
+                nodes_[i].sym = o.sym;
                 return true;
             }
         }
@@ -53,6 +56,57 @@ public:
         buckets_[b] = i;
         ++count_;
         return true;
+    }
+
+    static constexpr std::uint32_t kNoSlot = 0xffffffffu;
+
+    std::uint32_t insert_at(std::uint64_t oid, const Order& o) {
+        if (o.shares == 0) return kNoSlot;
+        const std::size_t b = bucket(oid);
+        for (std::uint32_t i = buckets_[b]; i != kEnd; i = nodes_[i].next) {
+            if (nodes_[i].oid != oid) continue;
+            nodes_[i].shares = o.shares;
+            nodes_[i].side_price = pack(o);
+            nodes_[i].sym = o.sym;
+            return i;
+        }
+        if (free_ == kEnd) return kNoSlot;
+        const std::uint32_t i = free_;
+        free_ = nodes_[i].next;
+        nodes_[i].oid = oid;
+        nodes_[i].shares = o.shares;
+        nodes_[i].side_price = pack(o);
+        nodes_[i].sym = o.sym;
+        nodes_[i].next = buckets_[b];
+        buckets_[b] = i;
+        ++count_;
+        return i;
+    }
+
+    [[nodiscard]] std::uint32_t find_slot(std::uint64_t oid) const {
+        for (std::uint32_t i = buckets_[bucket(oid)]; i != kEnd; i = nodes_[i].next) {
+            if (nodes_[i].oid == oid) return i;
+        }
+        return kNoSlot;
+    }
+
+    [[nodiscard]] Order at(std::uint32_t slot) const { return unpack(nodes_[slot]); }
+
+    void set_shares_at(std::uint32_t slot, std::uint32_t shares) { nodes_[slot].shares = shares; }
+
+    void set_side_sym_at(std::uint32_t slot, std::uint8_t side, std::uint16_t sym) {
+        nodes_[slot].side_price =
+            (static_cast<std::uint32_t>(side) << 31) | (nodes_[slot].side_price & 0x7fffffffu);
+        nodes_[slot].sym = sym;
+    }
+
+    void erase_at(std::uint32_t slot) {
+        std::uint32_t* link = &buckets_[bucket(nodes_[slot].oid)];
+        for (std::uint32_t i = *link; i != kEnd; link = &nodes_[i].next, i = *link) {
+            if (i != slot) continue;
+            unlink(link, i);
+            return;
+        }
     }
 
     void ask_for_all(const std::uint64_t* oids, std::size_t n) const {
@@ -108,6 +162,7 @@ private:
         std::uint32_t shares = 0;
         std::uint32_t side_price = 0;
         std::uint32_t next = 0;
+        std::uint16_t sym = 0;
     };
 
     static constexpr std::uint32_t kEnd = 0xffffffffu;
@@ -117,7 +172,8 @@ private:
     }
     static Order unpack(const Node& n) {
         return Order{n.shares, n.side_price & 0x7fffffffu,
-                     static_cast<std::uint8_t>(n.side_price >> 31)};
+                     static_cast<std::uint8_t>(n.side_price >> 31),
+                     n.sym};
     }
 
     [[nodiscard]] std::size_t bucket(std::uint64_t oid) const noexcept {

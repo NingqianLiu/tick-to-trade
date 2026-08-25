@@ -43,7 +43,6 @@
 #include "net/nic_stats.hpp"
 #include "net/mintcp.hpp"
 #include "net/ouch.hpp"
-#include "net/ring.hpp"
 
 namespace {
 
@@ -54,23 +53,18 @@ struct Options {
     std::uint32_t dst_ip = eth::ipv4(239, 9, 9, 1);
     std::uint16_t dst_port = 26477;
     std::uint16_t dst_port_b = 0;
-    unsigned shards = 3;
     int cpu_base = 4;
     std::uint32_t threshold = 75;
+    bool group = true;
+    bool split_ab = false;
     std::uint64_t idle_ms = 2000;
     const char* order_ip = nullptr;
     std::uint16_t order_port = 45100;
     const char* order_local = "10.9.9.2";
     const char* stat = nullptr;
-    bool own_tcp = true;
-    bool rising = true;
-    const char* out = nullptr;
-    bool profile = false;
-    bool batch_packets = false;
-    int gather = 1;
     bool segments = false;
-    int ahead = 0;
-    unsigned every = 0;
+    const char* out = nullptr;
+    bool batch_packets = false;
     bool coalesce = true;
     bool lock_memory = false;
 };
@@ -85,6 +79,10 @@ static_assert(mintcp::kHeaderLen + kMaxPerFrame * 50 <= cfg::kOrderSlotBytes,
 
 constexpr std::size_t kMaxPollEvents = 256;
 
+constexpr std::size_t kMaxMsgsPerPacket =
+    (cfg::kRxSlotBytes - cfg::kRxPrefixBytes - eth::kHeaderBytes - mold::kHeaderLen) / 14;
+constexpr std::size_t kMaxHits = kMaxPollEvents * kMaxMsgsPerPacket;
+
 struct Shard {
     Shard(std::size_t orders, std::size_t level_words, std::uint32_t pct,
           const win::Params& wp)
@@ -93,25 +91,20 @@ struct Shard {
     book::OrderBook book;
     book::Imbalance signal;
     win::Tracker phase;
-    ring::Cursor cursor;
     std::uint64_t messages = 0, applied = 0, buys = 0, sells = 0;
     std::uint64_t applied_window = 0;
     std::uint64_t gaps = 0, duplicates = 0, lapped = 0;
     std::uint64_t expect_seq = 0;
     bool started = false;
 
-    int fd = -1;
     ef::Vi tx;
     ef::Frames txbuf;
-    onload_delegated_send ds{};
-    bool ready = false;
     std::size_t next_slot = 0;
     std::uint32_t user_ref = 1;
     std::uint64_t sent = 0, refused = 0, stamped = 0, reaped = 0, no_slot = 0;
     std::uint64_t wnd_block = 0;
     std::uint32_t wnd_min = 0xffffffffu, wnd_max = 0;
     std::uint64_t frames = 0;
-    std::uint64_t why[8] = {};
     ef_vi_tx_warm_state warm_state{};
     std::uint64_t since_send = 0, warmed = 0;
     struct Order {
@@ -120,25 +113,20 @@ struct Shard {
         std::uint64_t in = 0;
         std::uint64_t s1 = 0, s2 = 0, s3 = 0, out = 0;
         std::uint64_t body = 0;
+        std::uint64_t parse = 0, book = 0;
         std::uint16_t before = 0;
         std::uint16_t sym = 0;
         std::uint16_t polln = 0, polli = 0;
         bool counted = false;
     };
-    unsigned every = 0;
-    unsigned since = 0;
-    std::uint64_t paced_seen = 0;
-    std::uint64_t ahead_polls = 0, ahead_fired = 0, ahead_msgs = 0;
-    std::size_t live_peak = 0;
     std::vector<std::uint64_t> top_cache = std::vector<std::uint64_t>(1u << 17, 0);
     std::uint64_t cur_body = 0;
+    std::uint64_t cur_parse = 0, cur_book = 0;
     Order pend[kMaxPerFrame];
     std::size_t pend_n = 0;
     Order flight[kOrderSlots][kMaxPerFrame];
     std::uint16_t flight_n[kOrderSlots] = {};
     bool coalesce = true;
-    bool seeded = false;
-    bool own_tcp = false;
     mintcp::Conn conn;
     std::size_t hdr_len = kHeaderRoom;
     std::uint32_t slot_end[kOrderSlots] = {};
@@ -153,8 +141,6 @@ struct Shard {
     sample::Log settle_at, settle_ns;
     hist::Hist latency;
     hist::Hist warmup;
-    hist::Hist stage[5];
-    bool profile = false;
     std::uint64_t window_messages = 0, paced_orders = 0;
     win::Phase was = win::Phase::kGap;
     std::uint64_t drain_mark = 0;
@@ -170,6 +156,7 @@ struct Shard {
     };
     std::vector<WindowStat> per_window = std::vector<WindowStat>(32768);
     std::size_t at_window = 0;
+
     std::vector<std::uint16_t> raw_window;
     std::vector<std::uint64_t> raw_rx;
     std::vector<std::uint16_t> raw_polln, raw_polli;
@@ -206,27 +193,42 @@ struct Shard {
     std::uint64_t at_s3[kOrderSlots] = {};
     std::vector<std::uint64_t> raw_s1, raw_s2, raw_s3;
     std::vector<std::uint64_t> raw_body;
+    std::vector<std::uint64_t> raw_parse, raw_book;
     std::uint64_t poll_at = 0;
-    std::uint64_t msgs_by_depth[kMaxPollEvents + 1][33] = {};
-    std::uint64_t polls_by_touch[8192] = {};
     std::uint16_t dirty[128] = {};
     std::uint64_t dirty_rx[128] = {};
     std::uint16_t dirty_before[128] = {};
     std::uint8_t dirty_paced[128] = {};
     std::uint8_t dirty_measured[128] = {};
     std::uint32_t dirty_n = 0;
+    const std::uint8_t* hit_body[kMaxHits] = {};
+    std::uint16_t hit_len[kMaxHits] = {};
+    std::uint64_t hit_rx[kMaxHits] = {};
+    std::uint16_t hit_before[kMaxHits] = {};
+    std::uint8_t hit_paced[kMaxHits] = {};
+    std::uint8_t hit_measured[kMaxHits] = {};
+    std::uint32_t hit_n = 0;
+
+    std::uint32_t bucket_add[kMaxHits] = {};
+    std::uint32_t bucket_repl[kMaxHits] = {};
+    std::uint32_t bucket_cut[kMaxHits] = {};
+    std::uint32_t bucket_del[kMaxHits] = {};
+    std::uint32_t add_n = 0, repl_n = 0, cut_n = 0, del_n = 0;
+
+    std::uint32_t repl_new[kMaxHits] = {};
+    std::uint32_t repl_old[kMaxHits] = {};
+
+    std::uint32_t look[kMaxHits] = {};
+    std::uint32_t keep_slot[kMaxHits] = {};
+    std::uint32_t kwant[kMaxHits] = {};
+    std::uint32_t zero[kMaxHits] = {};
+
+    bool group = true;
+    bool split_ab = false;
+    bool collect = true;
+    std::uint64_t polls_done = 0;
+    std::uint64_t ab_polls[2] = {}, ab_ticks[2] = {}, ab_msgs[2] = {};
     std::vector<std::uint64_t> prev_top = std::vector<std::uint64_t>(1u << 16, 0);
-    bool rising = true;
-    struct PollRec {
-        std::uint64_t at;
-        std::uint64_t rx;
-        std::uint32_t events;
-        std::uint32_t orders;
-        std::uint32_t msgs;
-        std::uint32_t all;
-    };
-    huge::Buffer<PollRec> polls;
-    std::size_t poll_rows = 0, poll_room = 0;
     std::uint64_t depth[65] = {};
     std::vector<std::uint8_t> symbols;
     std::vector<std::uint8_t> traded;
@@ -278,35 +280,13 @@ bool parse_ip(const char* s, std::uint32_t* out) {
     return true;
 }
 
-bool open_order_path(Shard* self, const char* ip, std::uint16_t port,
-                     const char* intf) {
-    if (self->own_tcp) {
-        if (!self->tx.open(intf, 0, 511,
-                           static_cast<enum ef_vi_flags>(EF_VI_TX_TIMESTAMPS |
-                                                         EF_VI_TX_PUSH_ALWAYS))) {
-            return false;
-        }
-        if (!self->txbuf.alloc(self->tx, kOrderSlots, cfg::kOrderSlotBytes)) return false;
-        return true;
-    }
-    self->fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    sockaddr_in a{};
-    a.sin_family = AF_INET;
-    a.sin_port = htons(port);
-    ::inet_pton(AF_INET, ip, &a.sin_addr);
-    if (::connect(self->fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
-        std::perror("connect");
-        return false;
-    }
-    int on = 1;
-    ::setsockopt(self->fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+bool open_order_path(Shard* self, const char* intf) {
     if (!self->tx.open(intf, 0, 511,
                        static_cast<enum ef_vi_flags>(EF_VI_TX_TIMESTAMPS |
                                                      EF_VI_TX_PUSH_ALWAYS))) {
         return false;
     }
     if (!self->txbuf.alloc(self->tx, kOrderSlots, cfg::kOrderSlotBytes)) return false;
-    (void)0;
     return true;
 }
 
@@ -317,20 +297,6 @@ void seed_slots(Shard* self) {
             ouch::prefill(base + k * ouch::kOrderPacketLen);
         }
     }
-    self->seeded = true;
-}
-
-void arm(Shard* self) {
-    std::uint8_t* slot = self->txbuf.at(self->next_slot);
-    self->ds.headers = slot;
-    self->ds.headers_len = kHeaderRoom;
-    const enum onload_delegated_send_rc rc = onload_delegated_send_prepare(
-        self->fd, static_cast<int>(kMaxPerFrame * ouch::kOrderPacketLen),
-        ONLOAD_DELEGATED_SEND_FLAG_RESOLVE_ARP, &self->ds);
-    self->ready = rc == ONLOAD_DELEGATED_SEND_RC_OK;
-    if (self->ready) self->hdr_len = static_cast<std::size_t>(self->ds.headers_len);
-    if (self->ready && !self->seeded) seed_slots(self);
-    if (!self->ready) ++self->why[static_cast<int>(rc) & 7];
 }
 
 void reap(Shard* self);
@@ -345,7 +311,7 @@ void flush_orders(Shard* self) {
     std::size_t frame = 0;
     std::uint64_t f2 = 0, f3 = 0, f4 = 0;
     const std::size_t id = self->next_slot;
-    if (self->own_tcp) {
+    {
         frame = self->conn.send(slot, msg, bytes, mintcp::kAck | mintcp::kPsh);
         f2 = tsc::now();
         if (ef_vi_transmit(self->tx.get(), self->txbuf.dma(id),
@@ -361,22 +327,6 @@ void flush_orders(Shard* self) {
         self->slot_end[id] = self->conn.snd_nxt();
         self->slot_at[id] = f3;
         self->slot_len[id] = static_cast<std::uint16_t>(frame);
-    } else {
-        onload_delegated_send_tcp_update(&self->ds, static_cast<int>(bytes), 1);
-        f2 = tsc::now();
-        frame = static_cast<std::size_t>(self->ds.headers_len) + bytes;
-        if (ef_vi_transmit(self->tx.get(), self->txbuf.dma(id),
-                           static_cast<int>(frame),
-                           static_cast<ef_request_id>(id)) < 0) {
-            self->refused += n;
-            self->pend_n = 0;
-            return;
-        }
-        self->sent += n;
-        f3 = tsc::now();
-        iovec iov{msg, bytes};
-        (void)onload_delegated_send_complete(self->fd, &iov, 1, 0);
-        f4 = tsc::now();
     }
     for (std::size_t k = 0; k < n; ++k) {
         Shard::Order& o = self->pend[k];
@@ -390,25 +340,12 @@ void flush_orders(Shard* self) {
     ++self->frames;
     self->next_slot = (self->next_slot + 1) % kOrderSlots;
     self->since_send = 0;
-    if (!self->own_tcp) arm(self);
 }
 
 void send_order(Shard* self, std::uint16_t sym, char side, std::uint64_t rx_ts,
                 bool keep, std::uint16_t before, std::uint32_t fixed = 0) {
     const std::uint64_t enter = tsc::now();
-    if (!self->own_tcp && self->frames - self->reaped >= kOrderSlots) {
-        reap(self);
-        if (self->frames - self->reaped >= kOrderSlots) {
-            if (self->no_slot == 0) {
-                std::fprintf(stderr,
-                             "card behind: frames %" PRIu64 " reaped %" PRIu64 "\n",
-                             self->frames, self->reaped);
-            }
-            ++self->no_slot;
-            return;
-        }
-    }
-    if (self->own_tcp) {
+    {
         while (self->acked_frames < self->frames &&
                mintcp::before_eq(self->slot_end[self->acked_frames % kOrderSlots],
                                  self->conn.snd_una())) {
@@ -436,10 +373,6 @@ void send_order(Shard* self, std::uint16_t sym, char side, std::uint64_t rx_ts,
             ++self->no_slot;
             return;
         }
-    } else if (!self->ready) {
-        ++self->refused;
-        arm(self);
-        return;
     }
     std::uint32_t price = 0, shares = 0;
     const std::uint8_t take_from =
@@ -451,18 +384,17 @@ void send_order(Shard* self, std::uint16_t sym, char side, std::uint64_t rx_ts,
     }
 
     std::uint8_t* slot = self->txbuf.at(self->next_slot);
-    const std::uint64_t s0 = self->profile ? tsc::now() : 0;
     std::uint8_t* base = slot + self->hdr_len;
     std::uint8_t* msg = base + self->pend_n * ouch::kOrderPacketLen;
     ouch::fill(msg, self->user_ref, side, 1, &self->symbols[sym * 8], price);
     ouch::set_cl_ord_id(msg, self->user_ref);
     ++self->user_ref;
-    const std::uint64_t s1 = self->profile ? tsc::now() : 0;
-    if (self->profile) self->stage[2].add(s1 - s0);
     Shard::Order& o = self->pend[self->pend_n++];
     o.rx = rx_ts;
     o.poll = self->poll_at;
     o.body = self->cur_body;
+    o.parse = self->cur_parse;
+    o.book = self->cur_book;
     o.in = enter;
     o.s1 = tsc::now();
     o.before = before;
@@ -518,7 +450,6 @@ void take_ack(Shard* self, const std::uint8_t* p, std::size_t len) {
 }
 
 void resend_stale(Shard* self, std::uint64_t rto) {
-    if (!self->own_tcp) return;
     while (self->acked_frames < self->frames &&
            mintcp::before_eq(self->slot_end[self->acked_frames % kOrderSlots],
                              self->conn.snd_una())) {
@@ -647,6 +578,8 @@ void reap(Shard* self) {
                     self->raw_s1.push_back(o.s1);
                     self->raw_s2.push_back(o.s2);
                     self->raw_body.push_back(o.body);
+                    self->raw_parse.push_back(o.parse);
+                    self->raw_book.push_back(o.book);
                     self->raw_s3.push_back(o.s3);
                 }
                 if (self->at_window < self->per_window.size()) {
@@ -673,16 +606,14 @@ void settle_dirty(Shard* self, bool trading) {
         const std::uint64_t was = self->prev_top[sym];
         self->prev_top[sym] = (bid3 << 32) | (ask3 & 0xffffffffull);
         if (what == book::Imbalance::Signal::kNone) continue;
-        if (self->rising) {
-            const std::uint64_t wb = was >> 32, ws = was & 0xffffffffull;
-            if (wb == 0 && ws == 0) continue;
-            const bool up = bid3 * (wb + ws) > wb * (bid3 + ask3);
-            if (what == book::Imbalance::Signal::kBuy) {
-                if (!up) continue;
-            } else {
-                const bool down = bid3 * (wb + ws) < wb * (bid3 + ask3);
-                if (!down) continue;
-            }
+        const std::uint64_t wb = was >> 32, ws = was & 0xffffffffull;
+        if (wb == 0 && ws == 0) continue;
+        const bool up = bid3 * (wb + ws) > wb * (bid3 + ask3);
+        if (what == book::Imbalance::Signal::kBuy) {
+            if (!up) continue;
+        } else {
+            const bool down = bid3 * (wb + ws) < wb * (bid3 + ask3);
+            if (!down) continue;
         }
         const char side =
             what == book::Imbalance::Signal::kBuy ? ouch::kBuy : ouch::kSell;
@@ -695,17 +626,180 @@ void settle_dirty(Shard* self, bool trading) {
     self->dirty_n = 0;
 }
 
+void note_applied(Shard* self, std::uint16_t touched, std::uint64_t rx,
+                  std::uint8_t paced, std::uint8_t measured, std::uint16_t before,
+                  bool trading) {
+    ++self->applied;
+    if (measured != 0) ++self->applied_window;
+    if (trading && ++self->since_send >= 256) {
+        warm(self);
+        self->since_send = 0;
+    }
+    std::uint32_t d = 0;
+    while (d < self->dirty_n && self->dirty[d] != touched) ++d;
+    const bool fresh = d == self->dirty_n;
+    if (fresh && self->dirty_n < 128) {
+        self->dirty[self->dirty_n++] = touched;
+    }
+    if (d < 128) {
+        if (fresh) {
+            self->dirty_rx[d] = rx;
+        } else if (rx < self->dirty_rx[d]) {
+            self->dirty_rx[d] = rx;
+        }
+        self->dirty_paced[d] = paced;
+        self->dirty_measured[d] = measured;
+        self->dirty_before[d] = before;
+    }
+}
+
+void apply_stream(Shard* self, bool trading) {
+    for (std::uint32_t i = 0; i < self->hit_n; ++i) {
+        const itch::Message m{self->hit_body[i], self->hit_len[i]};
+        std::uint16_t touched = 0;
+        if (self->book.apply(m, &touched)) {
+            note_applied(self, touched, self->hit_rx[i], self->hit_paced[i],
+                         self->hit_measured[i], self->hit_before[i], trading);
+        }
+    }
+}
+
+void apply_grouped(Shard* self, bool trading) {
+    for (std::uint32_t k = 0; k < self->add_n; ++k) {
+        const std::uint32_t i = self->bucket_add[k];
+        const std::uint8_t* b = self->hit_body[i];
+        const std::uint16_t sym = itch::read_be<std::uint16_t>(b + itch::kLocateOff);
+        const book::OrderTable::Order o{
+            itch::read_be<std::uint32_t>(b + itch::kAddSharesOff),
+            itch::read_be<std::uint32_t>(b + itch::kAddPriceOff),
+            static_cast<std::uint8_t>(b[itch::kAddSideOff] == 'B' ? 0 : 1), sym};
+        self->book.insert_at(itch::read_be<std::uint64_t>(b + itch::kAddRefOff), o);
+        self->book.level_move(sym, o.side, o.price, static_cast<std::int64_t>(o.shares));
+        note_applied(self, sym, self->hit_rx[i], self->hit_paced[i],
+                     self->hit_measured[i], self->hit_before[i], trading);
+    }
+    for (std::uint32_t k = 0; k < self->repl_n; ++k) {
+        const std::uint8_t* b = self->hit_body[self->bucket_repl[k]];
+        const book::OrderTable::Order o{
+            itch::read_be<std::uint32_t>(b + itch::kReplaceSharesOff),
+            itch::read_be<std::uint32_t>(b + itch::kReplacePriceOff), 0, 0};
+        self->repl_new[k] =
+            self->book.insert_at(itch::read_be<std::uint64_t>(b + itch::kReplaceNewRefOff), o);
+    }
+    std::uint32_t missing = 0;
+    for (std::uint32_t k = 0; k < self->repl_n; ++k) {
+        const std::uint8_t* b = self->hit_body[self->bucket_repl[k]];
+        const std::uint32_t slot =
+            self->book.find_slot(itch::read_be<std::uint64_t>(b + itch::kReplaceOldRefOff));
+        self->repl_old[k] = slot;
+        missing += slot == book::OrderTable::kNoSlot ? 1u : 0u;
+    }
+    if (missing == 0) {
+        for (std::uint32_t k = 0; k < self->repl_n; ++k) {
+            const book::OrderTable::Order o = self->book.at(self->repl_old[k]);
+            self->book.set_side_sym_at(self->repl_new[k], o.side, o.sym);
+        }
+        for (std::uint32_t k = 0; k < self->repl_n; ++k) {
+            const book::OrderTable::Order o = self->book.at(self->repl_old[k]);
+            self->book.level_move(o.sym, o.side, o.price, -static_cast<std::int64_t>(o.shares));
+            self->book.erase_at(self->repl_old[k]);
+            const book::OrderTable::Order fresh = self->book.at(self->repl_new[k]);
+            self->book.level_move(fresh.sym, fresh.side, fresh.price,
+                                  static_cast<std::int64_t>(fresh.shares));
+            note_applied(self, fresh.sym, self->hit_rx[self->bucket_repl[k]],
+                         self->hit_paced[self->bucket_repl[k]],
+                         self->hit_measured[self->bucket_repl[k]],
+                         self->hit_before[self->bucket_repl[k]], trading);
+        }
+    } else {
+        for (std::uint32_t k = 0; k < self->repl_n; ++k) {
+            if (self->repl_old[k] == book::OrderTable::kNoSlot) continue;
+            const book::OrderTable::Order o = self->book.at(self->repl_old[k]);
+            self->book.set_side_sym_at(self->repl_new[k], o.side, o.sym);
+        }
+        for (std::uint32_t k = 0; k < self->repl_n; ++k) {
+            if (self->repl_old[k] == book::OrderTable::kNoSlot) {
+                self->book.erase_at(self->repl_new[k]);
+                continue;
+            }
+            const book::OrderTable::Order o = self->book.at(self->repl_old[k]);
+            self->book.level_move(o.sym, o.side, o.price, -static_cast<std::int64_t>(o.shares));
+            self->book.erase_at(self->repl_old[k]);
+            const book::OrderTable::Order fresh = self->book.at(self->repl_new[k]);
+            self->book.level_move(fresh.sym, fresh.side, fresh.price,
+                                  static_cast<std::int64_t>(fresh.shares));
+            note_applied(self, fresh.sym, self->hit_rx[self->bucket_repl[k]],
+                         self->hit_paced[self->bucket_repl[k]],
+                         self->hit_measured[self->bucket_repl[k]],
+                         self->hit_before[self->bucket_repl[k]], trading);
+        }
+    }
+    {
+        for (std::uint32_t k = 0; k < self->del_n; ++k) {
+            self->look[k] = self->book.find_slot(itch::read_be<std::uint64_t>(
+                self->hit_body[self->bucket_del[k]] + itch::kDeleteRefOff));
+        }
+        std::uint32_t n = 0;
+        for (std::uint32_t k = 0; k < self->del_n; ++k) {
+            self->keep_slot[n] = self->look[k];
+            self->kwant[n] = self->bucket_del[k];
+            n += self->look[k] != book::OrderTable::kNoSlot ? 1u : 0u;
+        }
+        for (std::uint32_t j = 0; j < n; ++j) {
+            const book::OrderTable::Order o = self->book.at(self->keep_slot[j]);
+            self->book.level_move(o.sym, o.side, o.price, -static_cast<std::int64_t>(o.shares));
+            self->book.erase_at(self->keep_slot[j]);
+            const std::uint32_t i = self->kwant[j];
+            note_applied(self, o.sym, self->hit_rx[i], self->hit_paced[i],
+                         self->hit_measured[i], self->hit_before[i], trading);
+        }
+    }
+    {
+        for (std::uint32_t k = 0; k < self->cut_n; ++k) {
+            const std::uint8_t* b = self->hit_body[self->bucket_cut[k]];
+            self->look[k] = self->book.find_slot(
+                itch::read_be<std::uint64_t>(b + itch::kExecRefOff));
+            self->kwant[k] = itch::read_be<std::uint32_t>(b + itch::kExecSharesOff);
+        }
+        std::uint32_t n = 0;
+        for (std::uint32_t k = 0; k < self->cut_n; ++k) {
+            self->keep_slot[n] = self->look[k];
+            self->kwant[n] = self->kwant[k];
+            self->zero[n] = self->bucket_cut[k];
+            n += self->look[k] != book::OrderTable::kNoSlot ? 1u : 0u;
+        }
+        std::uint32_t z = 0;
+        for (std::uint32_t j = 0; j < n; ++j) {
+            const book::OrderTable::Order o = self->book.at(self->keep_slot[j]);
+            const std::uint32_t off = self->kwant[j] < o.shares ? self->kwant[j] : o.shares;
+            self->book.set_shares_at(self->keep_slot[j], o.shares - off);
+            self->book.level_move(o.sym, o.side, o.price, -static_cast<std::int64_t>(off));
+            const std::uint32_t i = self->zero[j];
+            note_applied(self, o.sym, self->hit_rx[i], self->hit_paced[i],
+                         self->hit_measured[i], self->hit_before[i], trading);
+            self->look[z] = self->keep_slot[j];
+            z += o.shares == off ? 1u : 0u;
+        }
+        for (std::uint32_t q = 0; q < z; ++q) self->book.erase_at(self->look[q]);
+    }
+    self->add_n = self->repl_n = self->cut_n = self->del_n = 0;
+}
+
+void apply_hits(Shard* self, bool trading) {
+    if (self->group) apply_grouped(self, trading);
+    else apply_stream(self, trading);
+    self->hit_n = 0;
+}
+
 void take_packet(Shard* self, const std::uint8_t* buf, std::uint32_t len,
-                 std::uint64_t hw_ts, unsigned id, unsigned shards,
+                 std::uint64_t hw_ts,
                  const std::unordered_map<std::string, std::uint32_t>* reference,
                  const std::unordered_set<std::string>* wanted,
                  bool trading, const std::atomic<std::uint64_t>* drained) {
-    const bool by_mask = (shards & (shards - 1)) == 0;
-    const unsigned mask = shards - 1;
     const std::uint8_t* traded = self->traded.empty() ? nullptr : self->traded.data();
     const auto mine = [=](std::uint16_t sym) {
         if (traded != nullptr && traded[sym] == 0) return false;
-        return by_mask ? (sym & mask) == id : sym % shards == id;
+        return true;
     };
     {
         if (len < eth::kHeaderBytes + mold::kHeaderLen) return;
@@ -723,8 +817,6 @@ void take_packet(Shard* self, const std::uint8_t* buf, std::uint32_t len,
             ++self->gaps;
         }
         self->expect_seq = seq + count;
-        self->msgs_by_depth[self->poll_n <= kMaxPollEvents ? self->poll_n : kMaxPollEvents]
-                           [count < 33 ? count : 32] += 1;
 
         const std::size_t payload = len - eth::kHeaderBytes - mold::kHeaderLen;
         (void)itch::for_each_message(
@@ -787,89 +879,38 @@ void take_packet(Shard* self, const std::uint8_t* buf, std::uint32_t len,
                     return true;
                 }
                 if (!mine(sym)) return true;
-                std::uint16_t touched = 0;
-                if (self->every != 0) {
-                    if (!paced) return true;
-                    ++self->paced_seen;
-                    if (++self->since < self->every) return true;
-                    self->since = 0;
-                    ++self->paced_orders;
-                    const std::uint16_t before2 =
-                        where == win::Phase::kSettle
-                            ? static_cast<std::uint16_t>(
-                                  (self->phase.open() - m.timestamp()) / 10000000 + 1)
-                            : 0;
-                    const char side2 =
-                        (self->user_ref & 1) ? ouch::kBuy : ouch::kSell;
-                    if (trading) {
-                        send_order(self, sym, side2, hw_ts, measured, before2,
-                                   1000000);
+                const std::uint16_t before =
+                    where == win::Phase::kSettle
+                        ? static_cast<std::uint16_t>(
+                              (self->phase.open() - m.timestamp()) / 10000000 + 1)
+                        : 0;
+                if (!self->collect) {
+                    std::uint16_t touched = 0;
+                    if (self->book.apply(m, &touched)) {
+                        note_applied(self, touched, hw_ts, paced ? 1 : 0,
+                                     measured ? 1 : 0, before, trading);
                     }
                     return true;
                 }
-                const std::uint64_t t0 = self->profile ? fenced_now() : 0;
-                if (!self->book.apply(m, &touched)) return true;
-                ++self->applied;
-                if (measured) ++self->applied_window;
-                if (self->profile && (self->applied & 0x2fff) == 0) {
-                    const std::size_t n = self->book.live();
-                    if (n > self->live_peak) self->live_peak = n;
+                if (self->hit_n == kMaxHits) apply_hits(self, trading);
+                if (self->group) {
+                    switch (m.type()) {
+                        case 'A': case 'F': self->bucket_add[self->add_n++] = self->hit_n; break;
+                        case 'U': self->bucket_repl[self->repl_n++] = self->hit_n; break;
+                        case 'E': case 'C': case 'X': self->bucket_cut[self->cut_n++] = self->hit_n; break;
+                        case 'D': self->bucket_del[self->del_n++] = self->hit_n; break;
+                        default: break;
+                    }
                 }
-                const std::uint64_t t1 = self->profile ? fenced_now() : 0;
-                if (trading && ++self->since_send >= 256) {
-                    warm(self);
-                    self->since_send = 0;
-                }
-                if (self->profile) self->stage[0].add(t1 - t0);
-                std::uint32_t d = 0;
-                while (d < self->dirty_n && self->dirty[d] != touched) ++d;
-                if (d == self->dirty_n && self->dirty_n < 128) {
-                    self->dirty[self->dirty_n++] = touched;
-                }
-                if (d < 128) {
-                    self->dirty_rx[d] = hw_ts;
-                    self->dirty_paced[d] = paced ? 1 : 0;
-                    self->dirty_measured[d] = measured ? 1 : 0;
-                    self->dirty_before[d] =
-                        where == win::Phase::kSettle
-                            ? static_cast<std::uint16_t>(
-                                  (self->phase.open() - m.timestamp()) / 10000000 + 1)
-                            : 0;
-                }
+                self->hit_body[self->hit_n] = m.body;
+                self->hit_len[self->hit_n] = m.len;
+                self->hit_rx[self->hit_n] = hw_ts;
+                self->hit_paced[self->hit_n] = paced ? 1 : 0;
+                self->hit_measured[self->hit_n] = measured ? 1 : 0;
+                self->hit_before[self->hit_n] = before;
+                ++self->hit_n;
                 return true;
             });
-    }
-    if (shards != 1) settle_dirty(self, trading);
-}
-
-void run_shard(Shard* self, unsigned id, unsigned shards, const ring::Ring* r,
-               const std::atomic<bool>* done, int cpu,
-               const std::unordered_map<std::string, std::uint32_t>* reference,
-               const std::unordered_set<std::string>* wanted,
-               bool trading, const std::atomic<std::uint64_t>* drained) {
-    pin(cpu);
-    if (trading && !self->own_tcp) arm(self);
-    ring::View v;
-    while (true) {
-        const ring::Ring::State s = r->take(self->cursor.want, &v);
-        if (s == ring::Ring::State::kWaiting) {
-            self->caught_up = true;
-            if (trading) reap(self);
-            if (done->load(std::memory_order_acquire) &&
-                self->cursor.want > r->published()) {
-                if (trading) reap(self);
-                return;
-            }
-            continue;
-        }
-        if (s == ring::Ring::State::kLapped) {
-            ++self->lapped;
-            self->cursor.want = r->published();
-            continue;
-        }
-        ++self->cursor.want;
-        take_packet(self, v.buf, v.len, v.hw_ts, id, shards, reference, wanted, trading,
-                    drained);
     }
 }
 
@@ -889,12 +930,20 @@ int main(int argc, char** argv) {
             opt.dst_port = static_cast<std::uint16_t>(std::strtoul(argv[++i], nullptr, 10));
         } else if (std::strcmp(a, "--dst-port-b") == 0 && has) {
             opt.dst_port_b = static_cast<std::uint16_t>(std::strtoul(argv[++i], nullptr, 10));
-        } else if (std::strcmp(a, "--shards") == 0 && has) {
-            opt.shards = static_cast<unsigned>(std::strtoul(argv[++i], nullptr, 10));
         } else if (std::strcmp(a, "--cpu-base") == 0 && has) {
             opt.cpu_base = std::atoi(argv[++i]);
         } else if (std::strcmp(a, "--threshold") == 0 && has) {
             opt.threshold = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (std::strcmp(a, "--one-at-a-time") == 0) {
+            opt.group = false;
+        } else if (std::strcmp(a, "--split-ab") == 0) {
+            opt.split_ab = true;
+        } else if (std::strcmp(a, "--stat") == 0 && has) {
+            opt.stat = argv[++i];
+        } else if (std::strcmp(a, "--segments") == 0) {
+            opt.segments = true;
+        } else if (std::strcmp(a, "--local-ip") == 0 && has) {
+            opt.order_local = argv[++i];
         } else if (std::strcmp(a, "--idle-ms") == 0 && has) {
             opt.idle_ms = std::strtoull(argv[++i], nullptr, 10);
         } else if (std::strcmp(a, "--order-ip") == 0 && has) {
@@ -903,50 +952,19 @@ int main(int argc, char** argv) {
             opt.order_port = static_cast<std::uint16_t>(std::strtoul(argv[++i], nullptr, 10));
         } else if (std::strcmp(a, "--out") == 0 && has) {
             opt.out = argv[++i];
-        } else if (std::strcmp(a, "--profile") == 0) {
-            opt.profile = true;
-        } else if (std::strcmp(a, "--batch-packets") == 0) {
-            opt.batch_packets = true;
-        } else if (std::strcmp(a, "--order-every") == 0 && i + 1 < argc) {
-            opt.every = static_cast<unsigned>(std::atoi(argv[++i]));
-        } else if (std::strcmp(a, "--ahead") == 0) {
-            opt.ahead = 1;
-        } else if (std::strcmp(a, "--segments") == 0) {
-            opt.segments = true;
-        } else if (std::strcmp(a, "--gather") == 0 && i + 1 < argc) {
-            const char* w = argv[++i];
-            opt.gather = std::strcmp(w, "prefetch") == 0 ? 1
-                         : std::strcmp(w, "copy") == 0   ? 2
-                                                         : 0;
-        } else if (std::strcmp(a, "--one-order-per-message") == 0) {
-            opt.coalesce = false;
-        } else if (std::strcmp(a, "--signal-level") == 0) {
-            opt.rising = false;
-        } else if (std::strcmp(a, "--own-tcp") == 0) {
-            opt.own_tcp = true;
-        } else if (std::strcmp(a, "--stat") == 0 && has) {
-            opt.stat = argv[++i];
-        } else if (std::strcmp(a, "--onload-send") == 0) {
-            opt.own_tcp = false;
-        } else if (std::strcmp(a, "--local-ip") == 0 && has) {
-            opt.order_local = argv[++i];
-        } else if (std::strcmp(a, "--lock-memory") == 0) {
-            opt.lock_memory = true;
         } else {
             std::fprintf(stderr,
                          "usage: trader [--intf I] [--reference CSV] [--symbols FILE]\n"
-                     "              [--dst-ip A.B.C.D]\n"
-                         "              [--dst-port N] [--dst-port-b N] [--shards N]\n"
+                         "              [--dst-ip A.B.C.D] [--dst-port N] [--dst-port-b N]\n"
                          "              [--cpu-base N] [--threshold N] [--idle-ms N]\n"
-                         "              [--order-ip A.B.C.D] [--order-port N] [--out DIR]\n"
-                         "              [--batch-packets] [--one-order-per-message]\n"
-                         "              [--onload-send] [--local-ip A.B.C.D]\n"
+                         "              [--order-ip A.B.C.D] [--order-port N]\n"
+                         "              [--local-ip A.B.C.D] [--out DIR] [--stat DIR]\n"
+                         "              [--split-ab] [--one-at-a-time]\n"
                          "  ITCH_SKIP_WINDOWS / ITCH_MAX_WINDOWS pick which windows count\n"
                          "  sending orders needs onload in front of it\n");
             return 2;
         }
     }
-    if (opt.shards == 0) opt.shards = 1;
 
     std::unordered_map<std::string, std::uint32_t> reference;
     std::vector<std::uint32_t> prices;
@@ -1012,22 +1030,19 @@ int main(int argc, char** argv) {
     }
 
     std::printf("signal         once per poll, %s\n",
-                opt.rising ? "and only when the imbalance moved further that way"
-                           : "every time it is past the threshold");
+                "and only when the imbalance moved further that way");
     std::printf("order path     %s\n",
-                opt.own_tcp ? "our own TCP" : "Onload delegated send");
+                "our own TCP");
+    std::printf("book path      %s\n",
+                opt.group ? "grouped in seven passes" : "one message at a time");
     std::uint32_t peer_ip = 0, local_ip = 0;
-    if (opt.own_tcp && opt.shards != 1) {
-        std::fprintf(stderr, "own tcp runs with one shard\n");
-        return 1;
-    }
     ef::Vi ack_vi;
     ef::Frames ack_frames;
     constexpr std::size_t kAckRingSlots = 512;
     constexpr std::size_t kAckSlotBytes = 2048;
     std::size_t ack_prefix = 0;
     std::size_t ack_post = kAckRingSlots - 1;
-    if (opt.own_tcp) {
+    {
         if (opt.order_ip == nullptr || !parse_ip(opt.order_ip, &peer_ip) ||
             !parse_ip(opt.order_local, &local_ip)) {
             std::fprintf(stderr, "own tcp needs both addresses\n");
@@ -1040,20 +1055,18 @@ int main(int argc, char** argv) {
         ef_vi_receive_set_buffer_len(ack_vi.get(), kAckSlotBytes);
         if (!ack_frames.alloc(ack_vi, kAckRingSlots, kAckSlotBytes)) return 1;
         ack_prefix = static_cast<std::size_t>(ef_vi_receive_prefix_len(ack_vi.get()));
-        for (unsigned i = 0; i < opt.shards; ++i) {
-            ef_filter_spec fs;
-            ef_filter_spec_init(&fs, EF_FILTER_FLAG_NONE);
-            const std::uint16_t lp = static_cast<std::uint16_t>(51000 + i);
-            const std::uint16_t rp = static_cast<std::uint16_t>(opt.order_port + i);
-            ef_filter_cookie ck;
-            if (ef_filter_spec_set_ip4_full(&fs, IPPROTO_TCP, htonl(local_ip),
-                                            static_cast<int>(htons(lp)),
-                                            htonl(peer_ip),
-                                            static_cast<int>(htons(rp))) < 0 ||
-                ef_vi_filter_add(ack_vi.get(), ack_vi.dh(), &fs, &ck) < 0) {
-                std::fprintf(stderr, "cannot listen for the order connection\n");
-                return 1;
-            }
+        ef_filter_spec fs;
+        ef_filter_spec_init(&fs, EF_FILTER_FLAG_NONE);
+        const std::uint16_t lp = static_cast<std::uint16_t>(51000 + 0);
+        const std::uint16_t rp = static_cast<std::uint16_t>(opt.order_port + 0);
+        ef_filter_cookie ck;
+        if (ef_filter_spec_set_ip4_full(&fs, IPPROTO_TCP, htonl(local_ip),
+                                        static_cast<int>(htons(lp)),
+                                        htonl(peer_ip),
+                                        static_cast<int>(htons(rp))) < 0 ||
+            ef_vi_filter_add(ack_vi.get(), ack_vi.dh(), &fs, &ck) < 0) {
+            std::fprintf(stderr, "cannot listen for the order connection\n");
+            return 1;
         }
         for (std::size_t k = 0; k + 1 < kAckRingSlots; ++k) {
             if (ef_vi_receive_init(ack_vi.get(), ack_frames.dma(k), k) < 0) return 1;
@@ -1075,15 +1088,13 @@ int main(int argc, char** argv) {
     const std::size_t whole = book::PriceLevels::budget_for(prices);
     const std::size_t words_each =
         opt.symbols != nullptr ? whole + (1u << 20)
-                               : whole / opt.shards * 3 / 2 + (1u << 20);
-    std::printf("%u shards, %.2f GB of prices and %zu orders each\n", opt.shards,
+                               : whole * 3 / 2 + (1u << 20);
+    std::printf("%.2f GB of prices and %zu orders\n",
                 words_each * 8.0 / 1e9, orders_each);
 
-    ring::Ring r(cfg::kRxRingSlots);
     std::atomic<bool> done{false};
     std::atomic<std::uint64_t> drained{0};
     std::vector<std::unique_ptr<Shard>> shards;
-    std::vector<std::thread> threads;
     if (opt.lock_memory) {
         mallopt(M_TRIM_THRESHOLD, -1);
         mallopt(M_MMAP_MAX, 0);
@@ -1101,48 +1112,46 @@ int main(int argc, char** argv) {
     const std::uint64_t skip = skip_env != nullptr ? std::strtoull(skip_env, nullptr, 10) : 0;
     const char* keep_env = std::getenv("ITCH_MAX_WINDOWS");
     const std::uint64_t keep = keep_env != nullptr ? std::strtoull(keep_env, nullptr, 10) : 0;
-    for (unsigned i = 0; i < opt.shards; ++i) {
-        shards.push_back(
-            std::make_unique<Shard>(orders_each, words_each, opt.threshold, wp));
-        shards.back()->rising = opt.rising;
-        shards.back()->skip = skip;
-        shards.back()->keep = keep;
-        shards.back()->raw.reserve(sample_cap);
-        shards.back()->raw_window.assign(sample_cap, 0);
-        shards.back()->raw_window.clear();
-        shards.back()->raw_rx.assign(sample_cap, 0);
-        shards.back()->raw_rx.clear();
-        shards.back()->raw_polln.assign(sample_cap, 0);
-        shards.back()->raw_polln.clear();
-        shards.back()->raw_polli.assign(sample_cap, 0);
-        shards.back()->raw_polli.clear();
-        shards.back()->raw_sym.assign(sample_cap, 0);
-        shards.back()->raw_sym.clear();
-        shards.back()->raw_poll.assign(sample_cap, 0);
-        shards.back()->raw_poll.clear();
-        shards.back()->raw_in.assign(sample_cap, 0);
-        shards.back()->raw_in.clear();
-        shards.back()->raw_out.assign(sample_cap, 0);
-        shards.back()->raw_out.clear();
-        shards.back()->raw_s1.assign(sample_cap, 0);
-        shards.back()->raw_s1.clear();
-        shards.back()->raw_s2.assign(sample_cap, 0);
-        shards.back()->raw_s2.clear();
-        shards.back()->raw_body.assign(sample_cap, 0);
-        shards.back()->raw_body.clear();
-        shards.back()->raw_s3.assign(sample_cap, 0);
-        shards.back()->raw_s3.clear();
-        shards.back()->poll_room = 128000000;
-        shards.back()->polls.resize(shards.back()->poll_room);
-        shards.back()->settle_at.reserve(sample_cap);
-        shards.back()->settle_ns.reserve(sample_cap);
-        if (!wanted.empty()) shards.back()->traded.assign(65536, 0);
-        shards.back()->profile = opt.profile;
-        shards.back()->coalesce = opt.coalesce;
-        shards.back()->own_tcp = opt.own_tcp;
-        shards.back()->every = opt.every;
-        shards.back()->every_unit = wp.mask == 0;
-    }
+    shards.push_back(
+        std::make_unique<Shard>(orders_each, words_each, opt.threshold, wp));
+    shards.back()->split_ab = opt.split_ab;
+    shards.back()->group = opt.group;
+    shards.back()->skip = skip;
+    shards.back()->keep = keep;
+    shards.back()->raw.reserve(sample_cap);
+    shards.back()->raw_window.assign(sample_cap, 0);
+    shards.back()->raw_window.clear();
+    shards.back()->raw_rx.assign(sample_cap, 0);
+    shards.back()->raw_rx.clear();
+    shards.back()->raw_polln.assign(sample_cap, 0);
+    shards.back()->raw_polln.clear();
+    shards.back()->raw_polli.assign(sample_cap, 0);
+    shards.back()->raw_polli.clear();
+    shards.back()->raw_sym.assign(sample_cap, 0);
+    shards.back()->raw_sym.clear();
+    shards.back()->raw_poll.assign(sample_cap, 0);
+    shards.back()->raw_poll.clear();
+    shards.back()->raw_in.assign(sample_cap, 0);
+    shards.back()->raw_in.clear();
+    shards.back()->raw_out.assign(sample_cap, 0);
+    shards.back()->raw_out.clear();
+    shards.back()->raw_s1.assign(sample_cap, 0);
+    shards.back()->raw_s1.clear();
+    shards.back()->raw_s2.assign(sample_cap, 0);
+    shards.back()->raw_s2.clear();
+    shards.back()->raw_body.assign(sample_cap, 0);
+    shards.back()->raw_body.clear();
+    shards.back()->raw_parse.assign(sample_cap, 0);
+    shards.back()->raw_parse.clear();
+    shards.back()->raw_book.assign(sample_cap, 0);
+    shards.back()->raw_book.clear();
+    shards.back()->raw_s3.assign(sample_cap, 0);
+    shards.back()->raw_s3.clear();
+    shards.back()->settle_at.reserve(sample_cap);
+    shards.back()->settle_ns.reserve(sample_cap);
+    if (!wanted.empty()) shards.back()->traded.assign(65536, 0);
+    shards.back()->coalesce = opt.coalesce;
+    shards.back()->every_unit = wp.mask == 0;
 
     if (opt.stat != nullptr && !shards.empty()) {
         constexpr std::size_t kStatCap = 80u << 20;
@@ -1168,66 +1177,38 @@ int main(int argc, char** argv) {
                               : std::to_string(skip + keep).c_str());
     }
     const bool trading = opt.order_ip != nullptr;
-    for (unsigned i = 0; i < opt.shards; ++i) {
-        if (!trading) continue;
-        if (!open_order_path(shards[i].get(), opt.order_ip,
-                             static_cast<std::uint16_t>(opt.order_port + i), opt.intf)) {
-            std::fprintf(stderr, "shard %u could not open its order path\n", i);
+    if (trading) {
+        if (!open_order_path(shards[0].get(), opt.intf)) {
+            std::fprintf(stderr, "could not open the order path\n");
             return 1;
         }
-        if (opt.own_tcp) {
-            if (!shake_hands(shards[i].get(), ack_vi, ack_frames, ack_prefix,
+        {
+            if (!shake_hands(shards[0].get(), ack_vi, ack_frames, ack_prefix,
                              kAckRingSlots, &ack_post, local_ip,
-                             static_cast<std::uint16_t>(51000 + i), peer_ip,
-                             static_cast<std::uint16_t>(opt.order_port + i),
+                             static_cast<std::uint16_t>(51000 + 0), peer_ip,
+                             static_cast<std::uint16_t>(opt.order_port + 0),
                              opt.intf)) {
-                std::fprintf(stderr, "shard %u could not open its own connection\n", i);
+                std::fprintf(stderr, "could not open our own connection\n");
                 return 1;
             }
-            std::printf("own connection %u opened, they start at %u\n", i,
-                        shards[i]->conn.rcv_nxt());
+            std::printf("own connection opened, they start at %u\n",
+                        shards[0]->conn.rcv_nxt());
             std::printf("window scale   they shift by %u, so at most %u bytes"
                         " may be unacknowledged\n",
-                        shards[i]->conn.peer_shift(),
-                        65535u << shards[i]->conn.peer_shift());
+                        shards[0]->conn.peer_shift(),
+                        65535u << shards[0]->conn.peer_shift());
         }
     }
-    const bool single = opt.shards == 1;
-    constexpr int kGatherNone = 0, kGatherPrefetch = 1, kGatherCopy = 2;
-    const int gather = opt.gather;
-    (void)kGatherNone;
-    std::printf("gather         %s\n",
-                gather == kGatherPrefetch ? "prefetch the batch"
-                : gather == kGatherCopy   ? "copy the batch"
-                                          : "none, touch each packet in turn");
-    std::vector<std::uint8_t> copymem(kMaxPollEvents * cfg::kRxSlotBytes, 0);
-    std::uint8_t* const copybuf = copymem.data();
-    constexpr std::size_t kAheadMax = 4096;
-    const std::size_t kAheadMin =
-        std::getenv("ITCH_AHEAD_MIN") != nullptr
-            ? std::strtoull(std::getenv("ITCH_AHEAD_MIN"), nullptr, 10)
-            : 16;
-    std::vector<std::uint64_t> aheadmem(kAheadMax, 0);
-    std::uint64_t* const ahead = aheadmem.data();
-    const int gather_ahead = opt.ahead;
-    std::printf("ahead          %s\n",
-                gather_ahead != 0 ? "collect the batch's order ids first"
-                                  : "off, one message at a time");
     const bool stat_on = opt.stat != nullptr;
     const bool timing = stat_on || opt.segments;
     std::printf("segments       %s\n",
-                timing ? "on, four segments timed per poll"
+                timing ? "on, six segments timed per poll"
                        : "off, no per-poll clock reads");
     const std::uint64_t rto_ticks =
         static_cast<std::uint64_t>(1e6 * tsc::ticks_per_ns());
-    for (unsigned i = 0; !single && i < opt.shards; ++i) {
-        threads.emplace_back(run_shard, shards[i].get(), i, opt.shards, &r, &done,
-                             opt.cpu_base < 0 ? -1 : opt.cpu_base + 1 + static_cast<int>(i),
-                             &reference, &wanted, trading, &drained);
-    }
 
     std::thread ack_thread;
-    if (opt.own_tcp && trading) {
+    if (trading) {
         const int ack_cpu = opt.cpu_base < 0 ? -1 : opt.cpu_base + 1;
         ack_thread = std::thread([&, ack_cpu] {
             if (ack_cpu >= 0) pin(ack_cpu);
@@ -1254,7 +1235,6 @@ int main(int argc, char** argv) {
     nic::Drops before;
     const bool have_counters = nic::read_drops(opt.intf, &before);
 
-    if (single && trading) arm(shards[0].get());
     const double tps = tsc::ticks_per_ns();
     const std::uint64_t idle_ticks = static_cast<std::uint64_t>(opt.idle_ms * 1e6 * tps);
     std::uint64_t last_seen = tsc::now(), start = 0;
@@ -1265,27 +1245,25 @@ int main(int argc, char** argv) {
     for (;;) {
         const int n = ef_eventq_poll(vi.get(), evs, kMaxPollEvents);
         if (n == 0) {
-            if (stat_on && single) shards[0]->last_empty = tsc::now();
+            if (stat_on) shards[0]->last_empty = tsc::now();
             const std::uint64_t e0 = stat_on ? tsc::now() : 0;
             drained.fetch_add(1, std::memory_order_relaxed);
             const std::uint64_t e1 = stat_on ? tsc::now() : 0;
-            if (single) {
-                shards[0]->caught_up = true;
-                if (trading) {
-                    reap(shards[0].get());
-                    const std::uint64_t e2 = stat_on ? tsc::now() : 0;
-                    resend_stale(shards[0].get(), rto_ticks);
-                    if (stat_on) {
-                        const std::uint64_t e3 = tsc::now();
-                        Shard* sh = shards[0].get();
-                        const std::uint64_t d[3] = {
-                            static_cast<std::uint64_t>((e1 - e0) / tps),
-                            static_cast<std::uint64_t>((e2 - e1) / tps),
-                            static_cast<std::uint64_t>((e3 - e2) / tps)};
-                        for (int q = 0; q < 3; ++q) {
-                            if (d[q] > sh->empty_worst[q]) sh->empty_worst[q] = d[q];
-                            if (d[q] >= 10000) ++sh->empty_over[q];
-                        }
+            shards[0]->caught_up = true;
+            if (trading) {
+                reap(shards[0].get());
+                const std::uint64_t e2 = stat_on ? tsc::now() : 0;
+                resend_stale(shards[0].get(), rto_ticks);
+                if (stat_on) {
+                    const std::uint64_t e3 = tsc::now();
+                    Shard* sh = shards[0].get();
+                    const std::uint64_t d[3] = {
+                        static_cast<std::uint64_t>((e1 - e0) / tps),
+                        static_cast<std::uint64_t>((e2 - e1) / tps),
+                        static_cast<std::uint64_t>((e3 - e2) / tps)};
+                    for (int q = 0; q < 3; ++q) {
+                        if (d[q] > sh->empty_worst[q]) sh->empty_worst[q] = d[q];
+                        if (d[q] >= 10000) ++sh->empty_over[q];
                     }
                 }
             }
@@ -1293,7 +1271,6 @@ int main(int argc, char** argv) {
             if (packets == 0 && tsc::now() - last_seen > idle_ticks * 15) {
                 std::fprintf(stderr, "nothing arrived\n");
                 done.store(true, std::memory_order_release);
-                for (auto& t : threads) t.join();
                 if (ack_thread.joinable()) ack_thread.join();
                 return 1;
             }
@@ -1302,74 +1279,33 @@ int main(int argc, char** argv) {
         last_seen = tsc::now();
         ++shards[0]->depth[n < 65 ? n : 64];
         const std::uint64_t g1 = timing ? fenced_now() : 0;
-        if (gather == kGatherPrefetch) {
-            for (int i = 0; i < n; ++i) {
-                if (EF_EVENT_TYPE(evs[i]) != EF_EVENT_TYPE_RX) continue;
-                const std::uint8_t* b = frames.at(EF_EVENT_RX_RQ_ID(evs[i]));
-                __builtin_prefetch(b, 0, 3);
-                __builtin_prefetch(b + 64, 0, 3);
-            }
-        } else if (gather == kGatherCopy) {
-            for (int i = 0; i < n; ++i) {
-                if (EF_EVENT_TYPE(evs[i]) != EF_EVENT_TYPE_RX) continue;
-                const std::size_t all = EF_EVENT_RX_BYTES(evs[i]);
-                std::memcpy(copybuf + static_cast<std::size_t>(i) * cfg::kRxSlotBytes,
-                            frames.at(EF_EVENT_RX_RQ_ID(evs[i])),
-                            all < cfg::kRxSlotBytes ? all : cfg::kRxSlotBytes);
-            }
-        }
-        if (gather_ahead != 0 && n >= 2) {
-            std::size_t got = 0;
-            for (int i = 0; i < n && got < kAheadMax; ++i) {
-                if (EF_EVENT_TYPE(evs[i]) != EF_EVENT_TYPE_RX) continue;
-                const std::uint8_t* d =
-                    (gather == kGatherCopy
-                         ? copybuf + static_cast<std::size_t>(i) * cfg::kRxSlotBytes
-                         : frames.at(EF_EVENT_RX_RQ_ID(evs[i]))) + prefix;
-                const std::size_t blen = EF_EVENT_RX_BYTES(evs[i]) - prefix;
-                std::size_t at2 = eth::kHeaderBytes + mold::kHeaderLen;
-                while (at2 + 2 <= blen && got < kAheadMax) {
-                    const std::size_t mlen =
-                        (static_cast<std::size_t>(d[at2]) << 8) | d[at2 + 1];
-                    if (mlen == 0 || at2 + 2 + mlen > blen) break;
-                    if (mlen >= itch::kDeleteRefOff + 8) {
-                        ahead[got++] = itch::read_be<std::uint64_t>(
-                            d + at2 + 2 + itch::kDeleteRefOff);
-                    }
-                    at2 += 2 + mlen;
-                }
-            }
-            ++shards[0]->ahead_polls;
-            shards[0]->ahead_msgs += got;
-            if (got >= kAheadMin) {
-                ++shards[0]->ahead_fired;
-                shards[0]->book.ask_for(ahead, got);
-            }
+        for (int i = 0; i < n; ++i) {
+            if (EF_EVENT_TYPE(evs[i]) != EF_EVENT_TYPE_RX) continue;
+            const std::uint8_t* b = frames.at(EF_EVENT_RX_RQ_ID(evs[i]));
+            __builtin_prefetch(b, 0, 3);
+            __builtin_prefetch(b + 64, 0, 3);
         }
         const std::uint64_t g2 = timing ? fenced_now() : 0;
-        if (single) shards[0]->cur_body = g2;
-        if (single) {
-            shards[0]->poll_msgs = 0; shards[0]->poll_when = 0;
-        }
-        const std::uint64_t sent_before = single ? shards[0]->sent : 0;
-        const std::uint64_t applied_before = single ? shards[0]->applied : 0;
+        shards[0]->cur_body = g2;
+        shards[0]->poll_msgs = 0; shards[0]->poll_when = 0;
         ++poll_seq;
-        const bool in_window = single && shards[0]->was == win::Phase::kWindow;
+        const bool in_window = shards[0]->was == win::Phase::kWindow;
         const std::uint64_t poll_tsc_always = in_window ? g1 : 0;
         const std::uint64_t stat_poll_tsc =
             (stat_on && poll_tsc_always == 0) ? tsc::now() : poll_tsc_always;
         std::uint64_t first_body = 0;
-        const bool keep_poll = in_window && (n >= 2 || (poll_seq & 1023) == 0) &&
-                               shards[0]->poll_rows < shards[0]->poll_room;
-        const std::uint64_t poll_tsc = poll_tsc_always;
         std::uint64_t first_rx = 0;
         std::uint64_t last_rx = 0;
+        if (shards[0]->split_ab) {
+            shards[0]->collect = (shards[0]->polls_done++ & 1) != 0;
+        }
+        const bool timed = shards[0]->split_ab && n >= 2;
+        const std::uint64_t applied_before = timed ? shards[0]->applied : 0;
+        const std::uint64_t ab_t0 = timed ? tsc::now() : 0;
         for (int i = 0; i < n; ++i) {
-            if (single) {
-                shards[0]->poll_n = static_cast<std::uint16_t>(n);
-                shards[0]->poll_i = static_cast<std::uint16_t>(i);
-                shards[0]->poll_at = poll_tsc_always;
-            }
+            shards[0]->poll_n = static_cast<std::uint16_t>(n);
+            shards[0]->poll_i = static_cast<std::uint16_t>(i);
+            shards[0]->poll_at = poll_tsc_always;
             if (EF_EVENT_TYPE(evs[i]) != EF_EVENT_TYPE_RX) {
                 if (EF_EVENT_TYPE(evs[i]) == EF_EVENT_TYPE_RX_NO_DESC_TRUNC ||
                     EF_EVENT_TYPE(evs[i]) == EF_EVENT_TYPE_RX_DISCARD) {
@@ -1379,10 +1315,7 @@ int main(int argc, char** argv) {
             }
             const std::size_t slot = EF_EVENT_RX_RQ_ID(evs[i]);
             const std::size_t len = EF_EVENT_RX_BYTES(evs[i]) - prefix;
-            std::uint8_t* buf =
-                gather == kGatherCopy
-                    ? copybuf + static_cast<std::size_t>(i) * cfg::kRxSlotBytes
-                    : frames.at(slot);
+            std::uint8_t* buf = frames.at(slot);
             if (packets == 0) start = tsc::now();
             ++packets;
 
@@ -1397,36 +1330,30 @@ int main(int argc, char** argv) {
                 (void)*probe;
                 first_body = tsc::now();
             }
-            if (single) {
-                take_packet(shards[0].get(), buf + prefix,
-                            static_cast<std::uint32_t>(len), at, 0, 1, &reference,
-                            &wanted, trading, &drained);
-            } else {
-                r.publish(buf + prefix, static_cast<std::uint32_t>(len), at, ts.tv_flags);
-            }
+            take_packet(shards[0].get(), buf + prefix,
+                        static_cast<std::uint32_t>(len), at, &reference,
+                        &wanted, trading, &drained);
             const std::size_t give = next_post & (cfg::kRxRingSlots - 1);
             ++next_post;
             if (ef_vi_receive_init(vi.get(), frames.dma(give), give) < 0) ++discards;
         }
-        if (single) settle_dirty(shards[0].get(), trading);
-        const std::uint64_t done_tsc = single ? tsc::now() : 0;
-        const std::uint32_t touched_now =
-            single ? static_cast<std::uint32_t>(shards[0]->applied - applied_before) : 0;
-        if (single) {
-            ++shards[0]->polls_by_touch[touched_now < 8192 ? touched_now : 8191];
+        shards[0]->cur_parse = timing ? fenced_now() : 0;
+        apply_hits(shards[0].get(), trading);
+        if (timed) {
+            const std::uint64_t touched = shards[0]->applied - applied_before;
+            if (touched != 0) {
+                const std::size_t w = shards[0]->collect ? 1 : 0;
+                shards[0]->ab_ticks[w] += tsc::now() - ab_t0;
+                ++shards[0]->ab_polls[w];
+                shards[0]->ab_msgs[w] += touched;
+            }
         }
-        if (single && trading) flush_orders(shards[0].get());
-        const std::uint64_t sent_tsc = single ? tsc::now() : 0;
-        if (keep_poll && first_rx != 0) {
-            Shard::PollRec& rec = shards[0]->polls[shards[0]->poll_rows++];
-            rec.at = poll_tsc;
-            rec.rx = first_rx;
-            rec.events = static_cast<std::uint32_t>(n);
-            rec.orders = static_cast<std::uint32_t>(shards[0]->sent - sent_before);
-            rec.msgs = touched_now;
-            rec.all = shards[0]->poll_msgs;
-        }
-        if (single && shards[0]->stat_used < shards[0]->stat_when.size()) {
+        shards[0]->cur_book = timing ? fenced_now() : 0;
+        settle_dirty(shards[0].get(), trading);
+        const std::uint64_t done_tsc = tsc::now();
+        if (trading) flush_orders(shards[0].get());
+        const std::uint64_t sent_tsc = tsc::now();
+        if (shards[0]->stat_used < shards[0]->stat_when.size()) {
             const std::size_t k = shards[0]->stat_used++;
             shards[0]->stat_when[k] = shards[0]->poll_when;
             shards[0]->stat_pkts[k] = static_cast<std::uint16_t>(n);
@@ -1460,16 +1387,14 @@ int main(int argc, char** argv) {
             shards[0]->stat_blind[k] = static_cast<std::uint32_t>(
                 blind > 0xffffffffull ? 0xffffffffu : blind);
         }
-        if (single) shards[0]->last_poll_seen = sent_tsc;
+        shards[0]->last_poll_seen = sent_tsc;
         ef_vi_receive_push(vi.get());
     }
     const double wall = (last_seen - start) / tps / 1e9;
 
     done.store(true, std::memory_order_release);
-    for (auto& t : threads) t.join();
     if (ack_thread.joinable()) ack_thread.join();
     for (auto& sh : shards) {
-        if (!sh->own_tcp) continue;
         const std::uint64_t stop = tsc::now() +
             static_cast<std::uint64_t>(2e9 * tsc::ticks_per_ns());
         while (sh->acked_frames < sh->frames && tsc::now() < stop) {
@@ -1508,7 +1433,6 @@ int main(int argc, char** argv) {
     std::uint64_t sent = 0, refused = 0, stamped = 0, no_slot = 0;
     std::uint64_t wnd_block = 0;
     std::uint32_t wnd_min = 0xffffffffu, wnd_max = 0;
-    std::uint64_t why[8] = {};
     std::uint64_t warmed = 0;
     std::uint64_t window_messages = 0, paced_orders = 0;
     std::uint64_t windows = 0, windows_dropped = 0, dropped_samples = 0;
@@ -1528,7 +1452,6 @@ int main(int argc, char** argv) {
         windows_dropped = s->windows_dropped;
         dropped_samples = s->dropped_samples;
         warm.merge(s->warmup);
-        for (int w = 0; w < 8; ++w) why[w] += s->why[w];
         pooled.merge(s->latency);
         messages = s->messages;
         applied += s->applied;
@@ -1553,6 +1476,19 @@ int main(int argc, char** argv) {
                 stamped, applied_window,
                 applied_window ? 100.0 * double(stamped) / double(applied_window) : 0.0);
     std::printf("orders alive   %" PRIu64 "\n", live);
+    if (shards[0]->split_ab) {
+        const double tps = tsc::ticks_per_ns();
+        static const char* const path[2] = {"apply as parsed  ", "collect then apply"};
+        for (std::size_t w = 0; w < 2; ++w) {
+            if (shards[0]->ab_msgs[w] == 0) continue;
+            std::printf("split %s %" PRIu64 " polls, %.2f book touches each, "
+                        "%.1f ns a touch\n",
+                        path[w], shards[0]->ab_polls[w],
+                        double(shards[0]->ab_msgs[w]) / double(shards[0]->ab_polls[w]),
+                        double(shards[0]->ab_ticks[w]) / tps /
+                            double(shards[0]->ab_msgs[w]));
+        }
+    }
     std::printf("bound          %" PRIu64 " securities, %" PRIu64 " without a price space\n",
                 bound, unbound);
     std::printf("rate           %.3f s, %.2f M messages/s\n", wall,
@@ -1560,21 +1496,6 @@ int main(int argc, char** argv) {
     std::printf("signals        %" PRIu64 " (buy %" PRIu64 ", sell %" PRIu64 ")"
                 ", of them in the paced stretch %" PRIu64 "\n",
                 buys + sells, buys, sells, paced_orders);
-    std::printf("live peak      %zu orders at once, table holds %zu\n",
-                shards[0]->live_peak, shards[0]->book.capacity());
-    if (shards[0]->ahead_polls != 0) {
-        std::printf("ahead          %" PRIu64 " polls collected, %" PRIu64
-                    " fired (%.1f%%), %.1f messages a poll on average\n",
-                    shards[0]->ahead_polls, shards[0]->ahead_fired,
-                    100.0 * static_cast<double>(shards[0]->ahead_fired) /
-                        static_cast<double>(shards[0]->ahead_polls),
-                    static_cast<double>(shards[0]->ahead_msgs) /
-                        static_cast<double>(shards[0]->ahead_polls));
-    }
-    if (shards[0]->paced_seen != 0) {
-        std::printf("paced msgs     %" PRIu64 " went past the counter\n",
-                    shards[0]->paced_seen);
-    }
     std::printf("window msgs    %" PRIu64 ", windows %" PRIu64 ", of them thrown away %"
                 PRIu64 " (%" PRIu64 " messages)\n",
                 window_messages, windows, windows_dropped, dropped_samples);
@@ -1582,9 +1503,6 @@ int main(int argc, char** argv) {
                 ", orphan %" PRIu64 ", discards %" PRIu64 ", table full %" PRIu64 "\n",
                 gaps, duplicates, lapped, orphan, discards, full);
     if (trading) {
-        static const char* reason[] = {"ok", "not an onload socket", "headers too small",
-                                       "send queue busy", "send window closed",
-                                       "no arp", "congestion window closed", "?"};
         std::printf("orders sent    %" PRIu64 ", refused %" PRIu64
                     ", no free slot %" PRIu64 ", stamped %" PRIu64 "\n",
                     sent, refused, no_slot, stamped);
@@ -1594,9 +1512,6 @@ int main(int argc, char** argv) {
                         wnd_block, wnd_min, wnd_max);
         }
         std::printf("path warmed    %" PRIu64 " times, nothing on the wire\n", warmed);
-        for (int w = 1; w < 8; ++w) {
-            if (why[w] != 0) std::printf("  prepare said  %-24s %" PRIu64 "\n", reason[w], why[w]);
-        }
         std::printf("warm up        %" PRIu64 " samples, thrown away\n", warm.samples());
         std::printf("tick to trade  p50 %" PRIu64 " p99 %" PRIu64 " p99.9 %" PRIu64
                     " p99.99 %" PRIu64 " max %" PRIu64 " ns over %" PRIu64 " samples\n",
@@ -1646,7 +1561,8 @@ int main(int argc, char** argv) {
             if (e != nullptr) {
                 std::fprintf(e, "# ticks_per_ns %.6f\n", tsc::ticks_per_ns());
                 std::fputs("window,rx_ns,latency_ns,poll_n,poll_i,sym,"
-                           "poll_tsc,body_tsc,in_tsc,out_tsc,fill_tsc,tcp_tsc,ring_tsc\n", e);
+                           "poll_tsc,body_tsc,parse_tsc,book_tsc,"
+                           "in_tsc,out_tsc,fill_tsc,tcp_tsc,ring_tsc\n", e);
                 std::uint64_t rows = 0;
                 for (const auto& s : shards) {
                     const std::size_t have =
@@ -1656,10 +1572,11 @@ int main(int argc, char** argv) {
                                      "%u,%" PRIu64 ",%" PRIu64 ",%u,%u,%u,"
                                      "%" PRIu64 ",%" PRIu64 ",%" PRIu64
                                      ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
-                                     ",%" PRIu64 "\n",
+                                     ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
                                      s->raw_window[i], s->raw_rx[i], s->raw.data()[i],
                                      s->raw_polln[i], s->raw_polli[i], s->raw_sym[i],
-                                     s->raw_poll[i], s->raw_body[i], s->raw_in[i],
+                                     s->raw_poll[i], s->raw_body[i],
+                                     s->raw_parse[i], s->raw_book[i], s->raw_in[i],
                                      s->raw_out[i],
                                      s->raw_s1[i], s->raw_s2[i], s->raw_s3[i]);
                         ++rows;
@@ -1667,43 +1584,6 @@ int main(int argc, char** argv) {
                 }
                 std::fclose(e);
                 std::printf("with context   %s/events.csv, %" PRIu64 " rows\n", opt.out, rows);
-            }
-            std::FILE* pf = std::fopen((std::string(opt.out) + "/polls.csv").c_str(), "w");
-            if (pf != nullptr) {
-                std::fprintf(pf, "# ticks_per_ns %.6f\n", tsc::ticks_per_ns());
-                std::fputs("tsc,rx_ns,events,orders,msgs,all\n", pf);
-                for (std::size_t i = 0; i < shards[0]->poll_rows; ++i) {
-                    const Shard::PollRec& r = shards[0]->polls[i];
-                    std::fprintf(pf, "%" PRIu64 ",%" PRIu64 ",%u,%u,%u,%u\n", r.at,
-                                 r.rx, r.events, r.orders, r.msgs, r.all);
-                }
-                std::fclose(pf);
-                std::printf("polls          %s/polls.csv, %zu rows\n", opt.out,
-                            shards[0]->poll_rows);
-            }
-            std::FILE* mf = std::fopen((std::string(opt.out) + "/msgs.csv").c_str(), "w");
-            if (mf != nullptr) {
-                std::fputs("poll_n,msgs_in_packet,packets\n", mf);
-                for (std::size_t dn = 0; dn <= kMaxPollEvents; ++dn) {
-                    for (int mc = 0; mc < 33; ++mc) {
-                        const std::uint64_t v = shards[0]->msgs_by_depth[dn][mc];
-                        if (v != 0) {
-                            std::fprintf(mf, "%zu,%d,%" PRIu64 "\n", dn, mc, v);
-                        }
-                    }
-                }
-                std::fclose(mf);
-                std::printf("packet fill    %s/msgs.csv\n", opt.out);
-            }
-            std::FILE* tf = std::fopen((std::string(opt.out) + "/touch.csv").c_str(), "w");
-            if (tf != nullptr) {
-                std::fputs("book_msgs_in_poll,polls\n", tf);
-                for (int k = 0; k < 8192; ++k) {
-                    const std::uint64_t v = shards[0]->polls_by_touch[k];
-                    if (v != 0) std::fprintf(tf, "%d,%" PRIu64 "\n", k, v);
-                }
-                std::fclose(tf);
-                std::printf("book touches   %s/touch.csv\n", opt.out);
             }
             std::FILE* c = std::fopen((std::string(opt.out) + "/settle.csv").c_str(), "w");
             if (c != nullptr) {
@@ -1719,21 +1599,6 @@ int main(int argc, char** argv) {
                 std::fclose(c);
                 std::printf("settle curve   %s/settle.csv, %" PRIu64 " rows\n", opt.out, rows);
             }
-        }
-    }
-    if (opt.profile) {
-        static const char* stage_name[5] = {"book update", "top of book",
-                                            "fill order", "hand to card",
-                                            "signal"};
-        hist::Hist st[5];
-        for (const auto& s : shards) for (int k = 0; k < 5; ++k) st[k].merge(s->stage[k]);
-        const double tps = tsc::ticks_per_ns();
-        for (int k = 0; k < 5; ++k) {
-            std::printf("  %-13s p50 %6.0f  p90 %6.0f  p99 %8.0f  p99.9 %8.0f ns over %" PRIu64 "\n",
-                        stage_name[k],
-                        st[k].quantile(0.5) / tps, st[k].quantile(0.9) / tps,
-                        st[k].quantile(0.99) / tps, st[k].quantile(0.999) / tps,
-                        st[k].samples());
         }
     }
     {

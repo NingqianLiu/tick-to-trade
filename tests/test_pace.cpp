@@ -53,4 +53,46 @@ TEST(Pace, the_rate_comes_from_the_environment) {
     unsetenv("ITCH_GAP_NS");
 }
 
+TEST(Pace, the_speed_divides_the_original_spacing) {
+    pace::Schedule s(500, 10 * pace::kUnitSpeed);
+    EXPECT_EQ(s.next(1000, kWin), 0);
+    EXPECT_EQ(s.next(1300, kWin), 30);
+    EXPECT_EQ(s.next(9300, kWin), 830);
+}
+
+TEST(Pace, the_speed_leaves_the_fixed_rate_alone) {
+    pace::Schedule s(500, 10 * pace::kUnitSpeed);
+    EXPECT_EQ(s.next(0, kGap), 0);
+    EXPECT_EQ(s.next(1000000000, kGap), 500);
+}
+
+TEST(Pace, the_leftover_of_the_division_is_carried) {
+    pace::Schedule s(500, 3 * pace::kUnitSpeed);
+    EXPECT_EQ(s.next(1000, kWin), 0);
+    EXPECT_EQ(s.next(1100, kWin), 33);
+    EXPECT_EQ(s.next(1200, kWin), 66);
+    EXPECT_EQ(s.next(1300, kWin), 100);
+}
+
+TEST(Pace, no_speed_means_the_exchange_speed) {
+    pace::Schedule s(500);
+    EXPECT_EQ(s.speed(), pace::kUnitSpeed);
+    EXPECT_EQ(s.next(1000, kWin), 0);
+    EXPECT_EQ(s.next(1300, kWin), 300);
+}
+
+TEST(Pace, the_speed_is_read_off_the_command_line) {
+    EXPECT_EQ(pace::speed_from_text("1x"), pace::kUnitSpeed);
+    EXPECT_EQ(pace::speed_from_text("10"), 10 * pace::kUnitSpeed);
+    EXPECT_EQ(pace::speed_from_text("100x"), 100 * pace::kUnitSpeed);
+    EXPECT_EQ(pace::speed_from_text("2.5x"), 2500u);
+    EXPECT_EQ(pace::speed_from_text("0.5x"), 500u);
+    EXPECT_EQ(pace::speed_from_text("0x"), 0u);
+    EXPECT_EQ(pace::speed_from_text("-2x"), 0u);
+    EXPECT_EQ(pace::speed_from_text("fast"), 0u);
+    EXPECT_EQ(pace::speed_from_text("10y"), 0u);
+    EXPECT_EQ(pace::speed_from_text("10xx"), 0u);
+    EXPECT_EQ(pace::speed_from_text(""), 0u);
+}
+
 }

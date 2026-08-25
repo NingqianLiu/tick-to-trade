@@ -47,7 +47,7 @@ TEST(Pack, the_frame_limit_closes_it_early) {
     EXPECT_EQ(p.payload(), n * kRec);
     EXPECT_LE(p.payload(), cfg::kMaxPacketPayload);
     EXPECT_GT(p.payload() + kRec, cfg::kMaxPacketPayload);
-    EXPECT_EQ(n, 12);
+    EXPECT_EQ(n, cfg::kMaxPacketPayload / kRec);
 }
 
 TEST(Pack, a_change_of_pacing_closes_it) {

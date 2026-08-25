@@ -73,6 +73,32 @@ public:
     [[nodiscard]] const Counters& counters() const noexcept { return c_; }
     [[nodiscard]] const PriceLevels& levels() const noexcept { return levels_; }
 
+    static constexpr std::uint32_t kNoSlot = OrderTable::kNoSlot;
+
+    std::uint32_t insert_at(std::uint64_t oid, const OrderTable::Order& o) {
+        return orders_.insert_at(oid, o);
+    }
+    [[nodiscard]] std::uint32_t find_slot(std::uint64_t oid) const {
+        return orders_.find_slot(oid);
+    }
+    [[nodiscard]] OrderTable::Order at(std::uint32_t slot) const { return orders_.at(slot); }
+    void set_shares_at(std::uint32_t slot, std::uint32_t shares) {
+        orders_.set_shares_at(slot, shares);
+    }
+    void set_side_sym_at(std::uint32_t slot, std::uint8_t side, std::uint16_t sym) {
+        orders_.set_side_sym_at(slot, side, sym);
+    }
+    void erase_at(std::uint32_t slot) { orders_.erase_at(slot); }
+
+    void level_move(std::uint16_t sym, std::uint8_t side, std::uint32_t price,
+                    std::int64_t delta) {
+        if (delta > 0) {
+            levels_.add(sym, side, price, static_cast<std::uint32_t>(delta));
+        } else {
+            levels_.remove(sym, side, price, static_cast<std::uint32_t>(-delta));
+        }
+    }
+
     void ask_for(const std::uint64_t* oids, std::size_t n) const {
         orders_.ask_for_all(oids, n);
     }

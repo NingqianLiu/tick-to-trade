@@ -17,6 +17,7 @@
 namespace {
 
 constexpr std::size_t kReadBuffer = 32u << 20;
+
 std::uint64_t errors = 0;
 
 void fail(const char* what, std::uint64_t where) {

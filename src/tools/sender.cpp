@@ -25,7 +25,7 @@
 namespace {
 
 constexpr std::size_t kReadBuffer = 0;
-constexpr std::size_t kSlotBytes = 512;
+constexpr std::size_t kSlotBytes = 2048;
 static_assert(cfg::kMaxFrameBytes <= kSlotBytes);
 constexpr std::size_t kDefaultArenaMb = 2048;
 constexpr int kTxRing = 2047;
@@ -41,8 +41,9 @@ struct Options {
     std::uint16_t dst_port = 26477;
     std::uint16_t dst_port_b = 0;
     std::uint64_t max_messages = 0;
+    std::uint32_t speed = pace::kUnitSpeed;
+    bool stop_after_window = false;
     int frames_node = -1;
-    bool profile = false;
     const char* drift_out = nullptr;
     std::string session = "ITCHBENCH0";
 };
@@ -71,18 +72,22 @@ bool parse(int argc, char** argv, Options* o) {
             o->src_port = static_cast<std::uint16_t>(std::strtoul(argv[++i], nullptr, 10));
         } else if (std::strcmp(a, "--dst-port") == 0 && has) {
             o->dst_port = static_cast<std::uint16_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (std::strcmp(a, "--stop-after-window") == 0) {
+            o->stop_after_window = true;
         } else if (std::strcmp(a, "--dst-port-b") == 0 && has) {
             o->dst_port_b = static_cast<std::uint16_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (std::strcmp(a, "--speed") == 0 && has) {
+            o->speed = pace::speed_from_text(argv[++i]);
+            if (o->speed == 0) {
+                std::fprintf(stderr, "--speed wants something like 10x, not %s\n", argv[i]);
+                return false;
+            }
         } else if (std::strcmp(a, "--max-messages") == 0 && has) {
             o->max_messages = std::strtoull(argv[++i], nullptr, 10);
         } else if (std::strcmp(a, "--frames-node") == 0 && has) {
             o->frames_node = std::atoi(argv[++i]);
         } else if (std::strcmp(a, "--drift-out") == 0 && has) {
             o->drift_out = argv[++i];
-        } else if (std::strcmp(a, "--profile") == 0) {
-            o->profile = true;
-        } else if (std::strcmp(a, "--session") == 0 && has) {
-            o->session = argv[++i];
         } else {
             std::fprintf(stderr, "unknown argument: %s\n", a);
             return false;
@@ -115,7 +120,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "usage: sender <itch-file> [--intf I] [--src-ip A.B.C.D] "
                      "[--dst-ip A.B.C.D] [--src-port N] [--dst-port N] "
-                     "[--dst-port-b N] [--max-messages N] [--session S]\n");
+                     "[--dst-port-b N] [--max-messages N] [--speed 10x] "
+                     "[--stop-after-window] "
+                     "[--frames-node N] "
+                     "[--drift-out FILE]\n");
         return 2;
     }
     Options opt;
@@ -150,13 +158,14 @@ int main(int argc, char** argv) {
 
     const win::Params wp = win::params_from_env();
     win::Tracker tracker(wp);
-    pace::Schedule sched(pace::gap_ns_from_env());
+    pace::Schedule sched(pace::gap_ns_from_env(), opt.speed);
+    std::uint64_t paced_due = 0, paced_act = 0, prev_due = 0, prev_now = 0;
+    bool have_prev = false;
     pkt::Packing packing;
     mold::Packer packer(opt.session.data(), 1, pkt::kMaxMessages, eth::kHeaderBytes);
 
     const double tps = tsc::ticks_per_ns();
     std::uint64_t packets = 0, messages = 0, retries = 0, sent_bytes = 0;
-    std::uint64_t late = 0, late_ticks = 0, worst_late = 0;
     std::uint64_t paced_windows = 0, worst_spread = 0, spread_sum = 0;
     struct Window { std::int64_t at_open, lo, hi; };
     std::vector<Window> per_window;
@@ -190,13 +199,6 @@ int main(int argc, char** argv) {
     reader.fill();
     std::printf("input          %s, %.1f GB in memory\n", opt.itch, reader.size() / 1e9);
 
-    std::uint64_t t_build = 0, t_queue = 0, t_wait = 0, t_push = 0;
-    std::uint64_t t_reap = 0, t_init = 0, worst_reap = 0, worst_init = 0, worst_push = 0;
-    hist::Hist h_reap, h_init, h_push, h_build;
-    std::uint64_t worst_queue = 0, worst_build = 0, thin_queue = ~0ull;
-    std::uint64_t worst_gap = 0, long_gaps = 0;
-    const auto clock = [&] { return opt.profile ? tsc::fenced() : 0; };
-
     struct Ready {
         std::uint32_t slot;
         std::uint16_t len;
@@ -208,6 +210,7 @@ int main(int argc, char** argv) {
     std::size_t build_slot = 0;
     std::uint64_t build_idx = 0, send_idx = 0;
     bool exhausted = false;
+    bool saw_window = false;
 
     const std::uint8_t* cur = reader.data();
     const std::uint8_t* const walk_end = cur + reader.size();
@@ -237,7 +240,6 @@ int main(int argc, char** argv) {
 
     const auto build_one = [&] {
         if (exhausted) return false;
-        const std::uint64_t t0 = clock();
         while (cur + itch::kLenPrefix <= walk_end) {
             const std::size_t body = itch::read_be<std::uint16_t>(cur);
             if (body == 0 || cur + itch::kLenPrefix + body > walk_end) break;
@@ -245,10 +247,11 @@ int main(int argc, char** argv) {
             const std::uint64_t ts = m.timestamp();
             win::note_session(m, &tracker);
             const win::Phase p = tracker.advance(ts);
+            if (p == win::Phase::kWindow) saw_window = true;
+            if (opt.stop_after_window && saw_window && p == win::Phase::kGap) break;
             const std::size_t rec = body + itch::kLenPrefix;
             if (packing.should_close(ts, rec, p)) {
                 emit();
-                if (opt.profile) t_build += tsc::now() - t0;
                 return true;
             }
             packing.add(ts, rec, p);
@@ -261,7 +264,6 @@ int main(int argc, char** argv) {
         exhausted = true;
         const bool last = !packer.empty();
         if (last) emit();
-        if (opt.profile) t_build += tsc::now() - t0;
         return last;
     };
 
@@ -271,16 +273,13 @@ int main(int argc, char** argv) {
                 frames.bytes() >> 20);
 
     const std::uint64_t build_guard = static_cast<std::uint64_t>(kBuildGuardNs * tps);
-    const std::uint64_t gap_floor = static_cast<std::uint64_t>(20000 * tps);
     const std::uint64_t start = tsc::now();
     for (;;) {
         if (send_idx == build_idx && !build_one()) break;
         const Ready e = ready[send_idx % ready_cap];
         const std::uint64_t due = static_cast<std::uint64_t>(e.due * tps);
 
-        const std::uint64_t t0 = clock();
         drain_to(kMaxInFlight - per_packet);
-        const std::uint64_t t0b = clock();
         for (std::size_t i = 0; i < per_packet; ++i) {
             int rc;
             while ((rc = ef_vi_transmit_init(vi.get(), frames.dma(e.slot + i), e.len,
@@ -295,57 +294,28 @@ int main(int argc, char** argv) {
             }
         }
 
-        const std::uint64_t t1 = clock();
-        if (opt.profile) {
-            t_reap += t0b - t0;
-            t_init += t1 - t0b;
-            if (t0b - t0 > worst_reap) worst_reap = t0b - t0;
-            if (t1 - t0b > worst_init) worst_init = t1 - t0b;
-            h_reap.add(static_cast<std::uint64_t>((t0b - t0) / tps));
-            h_init.add(static_cast<std::uint64_t>((t1 - t0b) / tps));
-        }
-        const std::uint64_t was_building = t_build;
         std::uint64_t now = tsc::now() - start;
         while (now < due) {
-            const std::uint64_t was = now;
             if (in_flight != 0) poll();
             if (!exhausted && build_idx - send_idx < ready_cap - 1 &&
                 (due - now > build_guard || build_idx - send_idx < ready_cap / 8)) {
-                const std::uint64_t b0 = tsc::now();
                 build_one();
-                const std::uint64_t took = tsc::now() - b0;
-                if (took > worst_build) worst_build = took;
-                if (opt.profile) h_build.add(static_cast<std::uint64_t>(took / tps));
             }
             now = tsc::now() - start;
-            const std::uint64_t gap = now - was;
-            if (gap > worst_gap) worst_gap = gap;
-            if (gap > gap_floor) ++long_gaps;
         }
-        const std::uint64_t t2 = clock();
         ef_vi_transmit_push(vi.get());
         in_flight += per_packet;
         sent_bytes += (e.len + 24) * per_packet;
-        if (!exhausted && build_idx - send_idx < thin_queue) thin_queue = build_idx - send_idx;
-        if (opt.profile) {
-            const std::uint64_t pushed = tsc::fenced() - t2;
-            if (pushed > worst_push) worst_push = pushed;
-            h_push.add(static_cast<std::uint64_t>(pushed / tps));
-            t_queue += t1 - t0;
-            if (t1 - t0 > worst_queue) worst_queue = t1 - t0;
-            t_wait += (t2 - t1) - (t_build - was_building);
-            t_push += tsc::now() - t2;
-        }
 
         if (win::Tracker::one_to_one(e.phase)) {
-            const std::int64_t behind = static_cast<std::int64_t>(now - due);
-            if (behind > 0) {
-                ++late;
-                late_ticks += static_cast<std::uint64_t>(behind);
-                if (static_cast<std::uint64_t>(behind) > worst_late) {
-                    worst_late = static_cast<std::uint64_t>(behind);
-                }
+            if (have_prev) {
+                paced_due += due - prev_due;
+                paced_act += now - prev_now;
             }
+            have_prev = true;
+            prev_due = due;
+            prev_now = now;
+            const std::int64_t behind = static_cast<std::int64_t>(now - due);
             if (e.phase == win::Phase::kWindow) {
                 if (!in_window) {
                     in_window = true;
@@ -366,6 +336,8 @@ int main(int argc, char** argv) {
                     per_window.back().hi = hi;
                 }
             }
+        } else {
+            have_prev = false;
         }
         ++send_idx;
     }
@@ -384,39 +356,17 @@ int main(int argc, char** argv) {
     std::printf("wall time      %.3f s (%.2f M messages/s, %.2f Gb/s)\n", wall,
                 messages / wall / 1e6, sent_bytes * 8.0 / wall / 1e9);
     std::printf("transmit ring  %" PRIu64 " retries on a full ring\n", retries);
+    std::printf("replay speed   %.3fx asked for, %.3fx actually delivered in the "
+                "paced stretch\n",
+                sched.speed() / double(pace::kUnitSpeed),
+                paced_act != 0 ? sched.speed() / double(pace::kUnitSpeed) *
+                                     static_cast<double>(paced_due) /
+                                     static_cast<double>(paced_act)
+                               : 0.0);
     std::printf("paced replay   %" PRIu64 " windows, spacing off by up to %.1f us in the worst "
                 "and %.1f us on average\n",
                 paced_windows, worst_spread / tps / 1e3,
                 paced_windows ? spread_sum / static_cast<double>(paced_windows) / tps / 1e3 : 0.0);
-    std::printf("               %" PRIu64 " packets behind their slot, %.3f s in total, "
-                "worst %.1f us (a steady offset moves nothing)\n",
-                late, late_ticks / tps / 1e9, worst_late / tps / 1e3);
-    if (opt.profile) {
-        const double f = frames_sent != 0 ? frames_sent : 1;
-        std::printf("per frame      queue %.0f, wait %.0f, doorbell %.0f ns on the timed "
-                    "path; building %.0f ns, off it\n",
-                    t_queue / tps / f, t_wait / tps / f, t_push / tps / f, t_build / tps / f);
-        std::printf("               of the queue: completions %.0f ns, descriptors %.0f ns; "
-                    "worst one of each %.1f / %.1f / doorbell %.1f us\n",
-                    t_reap / tps / f, t_init / tps / f, worst_reap / tps / 1e3,
-                    worst_init / tps / 1e3, worst_push / tps / 1e3);
-        std::printf("               worst queue %.1f us, worst build in the run %.1f us, "
-                    "run-up never below %" PRIu64 " packets\n",
-                    worst_queue / tps / 1e3, worst_build / tps / 1e3, thin_queue);
-        const auto show = [&](const char* what, const hist::Hist& h) {
-            std::printf("  %-12s p50 %6" PRIu64 "  p90 %7" PRIu64 "  p99 %8" PRIu64
-                        "  p99.9 %9" PRIu64 "  p99.99 %10" PRIu64 "  max %10" PRIu64
-                        " ns over %" PRIu64 "\n",
-                        what, h.quantile(0.5), h.quantile(0.9), h.quantile(0.99),
-                        h.quantile(0.999), h.quantile(0.9999), h.largest(), h.samples());
-        };
-        show("completions", h_reap);
-        show("descriptors", h_init);
-        show("doorbell", h_push);
-        show("building", h_build);
-        std::printf("               longest the thread went without running %.1f us, "
-                    "%" PRIu64 " turns over 20 us\n", worst_gap / tps / 1e3, long_gaps);
-    }
     std::printf("completions    %" PRIu64 " events for %" PRIu64 " frames\n", tx_events,
                 frames_sent);
     if (opt.drift_out != nullptr) {

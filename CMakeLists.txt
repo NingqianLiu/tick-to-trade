@@ -5,8 +5,6 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Sender and receiver are two processes on this one host, so nothing has to run
-# anywhere else and the build can use everything the CPU offers.
 set(ITCH_ARCH "native" CACHE STRING "value passed to -march")
 set(ITCH_OPT "-O3" CACHE STRING "optimisation level, so -O2 and -O3 can be compared")
 add_compile_options(${ITCH_OPT} -march=${ITCH_ARCH} -Wall -Wextra)
@@ -14,13 +12,15 @@ add_compile_options(${ITCH_OPT} -march=${ITCH_ARCH} -Wall -Wextra)
 add_library(itch INTERFACE)
 target_include_directories(itch INTERFACE ${CMAKE_SOURCE_DIR}/src)
 
-foreach(tool itch_scan book_ref live_peak make_packets make_prev_close book_check frame_check apply_bench)
+foreach(tool itch_scan book_ref live_peak make_packets make_prev_close book_check frame_check apply_bench cross_check batch_check uside)
   add_executable(${tool} src/tools/${tool}.cpp)
   target_link_libraries(${tool} PRIVATE itch)
 endforeach()
 
-# The tools that drive the card. Everything above builds without ef_vi, so a
-# machine that only has the data can still run the checks.
+add_executable(batch_check_stats src/tools/batch_check.cpp)
+target_link_libraries(batch_check_stats PRIVATE itch)
+target_compile_definitions(batch_check_stats PRIVATE ITCH_BATCH_STATS)
+
 find_library(CIUL_LIBRARY NAMES ciul1 ciul)
 find_path(CIUL_INCLUDE etherfabric/ef_vi.h)
 if(CIUL_LIBRARY AND CIUL_INCLUDE)
@@ -30,8 +30,6 @@ if(CIUL_LIBRARY AND CIUL_INCLUDE)
     target_include_directories(${tool} PRIVATE ${CIUL_INCLUDE})
   endforeach()
 
-  # The order path also needs Onload, for the connection whose one packet we
-  # push out ourselves.
   find_library(ONLOAD_EXT_LIBRARY NAMES onload_ext)
   find_path(ONLOAD_EXT_INCLUDE onload/extensions.h)
   if(ONLOAD_EXT_LIBRARY AND ONLOAD_EXT_INCLUDE)
@@ -47,9 +45,6 @@ else()
   message(WARNING "ef_vi not found, the tools that drive the card are not built")
 endif()
 
-# One test binary per module. GoogleTest is the only thing this repository
-# links that it does not ship, and only the tests link it, so the library and
-# the tools still build on a machine that does not have it.
 find_package(GTest)
 if(GTest_FOUND)
   enable_testing()
