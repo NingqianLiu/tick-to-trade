@@ -9,6 +9,8 @@
 
 namespace {
 
+// Builds one framed message: 2-byte big-endian length, then a body whose
+// header is filled in the way the wire format specifies.
 void append(std::vector<std::uint8_t>& out, char type, std::uint16_t locate,
             std::uint64_t ts, std::uint16_t len) {
     out.push_back(static_cast<std::uint8_t>(len >> 8));
@@ -31,6 +33,8 @@ TEST(Itch, readers) {
     EXPECT_EQ(itch::read_be<std::uint64_t>(buf), 0x123456789abcdef0ull);
     EXPECT_EQ(itch::read_be48(buf), 0x123456789abcull);
 
+    // 09:30:00 Eastern is 34,200 s past midnight; the market-open timestamp is
+    // the value the parser has to reproduce exactly.
     const std::uint64_t open_ns = 34200ull * 1000000000ull;
     std::uint8_t ts[6];
     for (int i = 0; i < 6; ++i) {
@@ -38,6 +42,9 @@ TEST(Itch, readers) {
     }
     EXPECT_EQ(itch::read_be48(ts), open_ns);
 
+    // Zero bytes inside the value. The two bytes left over by widening six to
+    // eight end up below the result and are shifted off; they never land among
+    // the value's own zeros.
     const std::uint8_t holes[6] = {0xaa, 0x00, 0xbb, 0x00, 0xcc, 0x00};
     EXPECT_EQ(itch::read_be48(holes), 0xaa00bb00cc00ull);
 }
@@ -48,7 +55,7 @@ TEST(Itch, body_len_table) {
     EXPECT_EQ(itch::kBodyLen['A'], 36);
     EXPECT_EQ(itch::kBodyLen['D'], 19);
     EXPECT_EQ(itch::kBodyLen['P'], 44);
-    EXPECT_EQ(itch::kBodyLen['z'], 0);
+    EXPECT_EQ(itch::kBodyLen['z'], 0);  // not a message type
 }
 
 TEST(Itch, framing) {
@@ -79,8 +86,10 @@ TEST(Itch, partial_tail) {
     std::vector<std::uint8_t> buf;
     append(buf, 'S', 0, 1, 12);
     append(buf, 'A', 1, 2, 36);
-    const std::size_t whole = 2 + 12;
+    const std::size_t whole = 2 + 12;  // only the first record is complete
 
+    // Cut in the middle of the second record: the framer must hand back one
+    // message and leave the tail for the next read.
     for (std::size_t cut : {whole + 1, whole + 2, whole + 20}) {
         const auto r = itch::for_each_message(buf.data(), cut,
                                               [](const itch::Message&) { return true; });
@@ -89,6 +98,7 @@ TEST(Itch, partial_tail) {
         EXPECT_EQ(r.stop, itch::FrameStop::kPartialTail);
     }
 
+    // Cutting exactly on the boundary is not a partial tail.
     const auto r = itch::for_each_message(buf.data(), whole,
                                           [](const itch::Message&) { return true; });
     EXPECT_EQ(r.consumed, whole);
@@ -100,6 +110,8 @@ TEST(Itch, stop_and_zero_length) {
     append(buf, 'S', 0, 1, 12);
     append(buf, 'A', 1, 2, 36);
 
+    // A bounded run stops after the first message but still reports it as
+    // consumed, so a caller can resume from there.
     const auto r = itch::for_each_message(buf.data(), buf.size(),
                                           [](const itch::Message&) { return false; });
     EXPECT_EQ(r.messages, 1);
@@ -113,4 +125,5 @@ TEST(Itch, stop_and_zero_length) {
     EXPECT_EQ(z.stop, itch::FrameStop::kZeroLength);
 }
 
-}
+}  // namespace
+

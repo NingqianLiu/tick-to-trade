@@ -14,6 +14,7 @@ using book::PriceLevels;
 constexpr std::uint8_t kBuy = PriceLevels::kBuy;
 constexpr std::uint8_t kSell = PriceLevels::kSell;
 
+// A hundred dollar security: its prices run from $12.50 to $800, all in cents.
 PriceLevels one(std::uint32_t reference = 1000000) {
     PriceLevels p(std::vector<std::uint32_t>{reference});
     EXPECT_TRUE(p.bind(7, reference));
@@ -22,13 +23,13 @@ PriceLevels one(std::uint32_t reference = 1000000) {
 
 TEST(PriceLevels, shares_come_back_at_the_price_they_went_in) {
     PriceLevels p = one();
-    p.add(7, kBuy, 999900, 300);
+    p.add(7, kBuy, 999900, 300);   // $99.99
     p.add(7, kBuy, 999900, 200);
-    p.add(7, kSell, 1000100, 50);
+    p.add(7, kSell, 1000100, 50);  // $100.01
 
     EXPECT_EQ(p.at(7, kBuy, 999900), 500u);
     EXPECT_EQ(p.at(7, kSell, 1000100), 50u);
-    EXPECT_EQ(p.at(7, kBuy, 1000100), 0u);
+    EXPECT_EQ(p.at(7, kBuy, 1000100), 0u);  // nothing on the buy side there
 
     p.remove(7, kBuy, 999900, 200);
     EXPECT_EQ(p.at(7, kBuy, 999900), 300u);
@@ -52,6 +53,7 @@ TEST(PriceLevels, the_best_price_is_the_highest_bid_and_the_lowest_offer) {
     EXPECT_EQ(price, 1000100u);
     EXPECT_EQ(shares, 50u);
 
+    // Taking the best away has to expose the one behind it.
     p.remove(7, kBuy, 999900, 20);
     ASSERT_TRUE(p.best(7, kBuy, &price, &shares));
     EXPECT_EQ(price, 999800u);
@@ -68,8 +70,10 @@ TEST(PriceLevels, three_deep_or_nothing) {
     p.add(7, kBuy, 999700, 4);
     EXPECT_EQ(p.top3(7, kBuy), 7u);
 
+    // A fourth, worse price does not join the top three.
     p.add(7, kBuy, 999600, 8);
     EXPECT_EQ(p.top3(7, kBuy), 7u);
+    // A fourth, better one pushes the worst of them out.
     p.add(7, kBuy, 1000000, 16);
     EXPECT_EQ(p.top3(7, kBuy), 16u + 1u + 2u);
 
@@ -80,11 +84,13 @@ TEST(PriceLevels, three_deep_or_nothing) {
     EXPECT_EQ(p.top3(7, kSell), 3u + 5u + 9u);
 }
 
+// The prices need not be neighbours: the summary layers exist so a gap of tens
+// of thousands of empty prices costs a couple of loads, not a scan.
 TEST(PriceLevels, far_apart_prices_still_come_out_in_order) {
     PriceLevels p = one();
-    p.add(7, kBuy, 200000, 1);
-    p.add(7, kBuy, 700000, 2);
-    p.add(7, kBuy, 1500000, 4);
+    p.add(7, kBuy, 200000, 1);   // $20
+    p.add(7, kBuy, 700000, 2);   // $70
+    p.add(7, kBuy, 1500000, 4);  // $150
     EXPECT_EQ(p.top3(7, kBuy), 7u);
 
     std::uint32_t price = 0, shares = 0;
@@ -93,37 +99,44 @@ TEST(PriceLevels, far_apart_prices_still_come_out_in_order) {
     ASSERT_TRUE(p.best(7, kSell, &price, &shares) == false);
 }
 
+// A security under a dollar quotes in hundredths of a cent, so it gets a second
+// stretch at that step. One that opens between one and eight dollars can fall
+// under a dollar during the day and needs both.
 TEST(PriceLevels, a_cheap_security_gets_both_steps) {
-    const std::uint32_t reference = 40000;
+    const std::uint32_t reference = 40000;  // $4
     PriceLevels p(std::vector<std::uint32_t>{reference});
     ASSERT_TRUE(p.bind(3, reference));
 
-    p.add(3, kBuy, 9876, 100);
-    p.add(3, kBuy, 20000, 200);
+    p.add(3, kBuy, 9876, 100);   // $0.9876, off the cent grid
+    p.add(3, kBuy, 20000, 200);  // $2.00
     EXPECT_EQ(p.at(3, kBuy, 9876), 100u);
     EXPECT_EQ(p.at(3, kBuy, 20000), 200u);
 
+    // A dollar and up wins, so the two dollar price is the better bid.
     std::uint32_t price = 0, shares = 0;
     ASSERT_TRUE(p.best(3, kBuy, &price, &shares));
     EXPECT_EQ(price, 20000u);
 
+    // Reversed for the offer side: the cheap one is the better offer.
     p.add(3, kSell, 9877, 5);
     p.add(3, kSell, 30000, 6);
     ASSERT_TRUE(p.best(3, kSell, &price, &shares));
     EXPECT_EQ(price, 9877u);
     EXPECT_EQ(shares, 5u);
 
+    // The best three cross from one stretch into the other.
     p.add(3, kSell, 9900, 7);
     EXPECT_EQ(p.top3(3, kSell), 5u + 7u + 6u);
 }
 
 TEST(PriceLevels, a_price_outside_the_band_is_left_untracked) {
-    PriceLevels p = one();
-    p.add(7, kBuy, 1999999900, 1000);
-    p.add(7, kBuy, 100, 1000);
+    PriceLevels p = one();  // $100 reference, so $12.50 to $800
+    p.add(7, kBuy, 1999999900, 1000);  // the sentinel price, far above the band
+    p.add(7, kBuy, 100, 1000);         // a cent, far below it
     EXPECT_EQ(p.at(7, kBuy, 1999999900), 0u);
     EXPECT_EQ(p.top3(7, kBuy), 0u);
 
+    // Removing one that was never tracked must not disturb anything either.
     p.add(7, kBuy, 999900, 5);
     p.remove(7, kBuy, 1999999900, 1000);
     EXPECT_EQ(p.at(7, kBuy, 999900), 5u);
@@ -138,8 +151,10 @@ TEST(PriceLevels, an_unbound_security_answers_nothing) {
     EXPECT_TRUE(p.bound(7));
 }
 
+// The whole point is that this agrees with the obvious version. Run a mixed
+// workload against std::map and compare the best three after every step.
 TEST(PriceLevels, it_matches_a_sorted_map_under_churn) {
-    const std::uint32_t reference = 500000;
+    const std::uint32_t reference = 500000;  // $50, so $6.25 to $400
     PriceLevels p(std::vector<std::uint32_t>{reference});
     ASSERT_TRUE(p.bind(1, reference));
     std::map<std::uint32_t, std::uint64_t> ref[2];
@@ -160,6 +175,8 @@ TEST(PriceLevels, it_matches_a_sorted_map_under_churn) {
 
     for (int step = 0; step < 100000; ++step) {
         const int s = static_cast<int>(rng() & 1);
+        // Cents inside the band, clustered near the reference so the best three
+        // move about instead of sitting still.
         const std::uint32_t price =
             (400000 + static_cast<std::uint32_t>(rng() % 2000) * 100);
         const std::uint32_t shares = static_cast<std::uint32_t>(rng() % 1000 + 1);
@@ -182,21 +199,26 @@ TEST(PriceLevels, it_matches_a_sorted_map_under_churn) {
     }
 }
 
+
+// A security so cheap that eight times its price is still under a dollar has no
+// cent-priced stretch at all. Getting that wrong subtracts a dollar from a
+// smaller number and asks for an impossible amount of memory.
 TEST(PriceLevels, a_security_under_a_dime_has_only_the_fine_step) {
-    const std::uint32_t reference = 400;
+    const std::uint32_t reference = 400;  // four cents
     PriceLevels p(std::vector<std::uint32_t>{reference});
     ASSERT_TRUE(p.bind(2, reference));
-    EXPECT_LT(p.bytes(), 1u << 20);
+    EXPECT_LT(p.bytes(), 1u << 20);  // kilobytes, not gigabytes
 
-    p.add(2, kBuy, 350, 10);
+    p.add(2, kBuy, 350, 10);   // $0.0350
     p.add(2, kBuy, 340, 20);
     p.add(2, kBuy, 330, 30);
     EXPECT_EQ(p.top3(2, kBuy), 60u);
     std::uint32_t price = 0, shares = 0;
     ASSERT_TRUE(p.best(2, kBuy, &price, &shares));
     EXPECT_EQ(price, 350u);
+    // A dollar is far outside its band and is not tracked.
     p.add(2, kBuy, 10000, 99);
     EXPECT_EQ(p.at(2, kBuy, 10000), 0u);
 }
 
-}
+}  // namespace

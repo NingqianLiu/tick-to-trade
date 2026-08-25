@@ -15,6 +15,8 @@ void put_be(std::uint8_t* p, std::uint64_t v, int bytes) {
     }
 }
 
+// Builds one message body of the declared length for its type and hands it to
+// the book, so nothing has to outlive the call.
 std::vector<std::uint8_t> body(char type, std::uint16_t locate) {
     std::vector<std::uint8_t> b(itch::kBodyLen[static_cast<unsigned char>(type)], 0);
     b[itch::kTypeOff] = static_cast<std::uint8_t>(type);
@@ -73,11 +75,11 @@ TEST(Book, add_and_execute) {
     EXPECT_EQ(bk.live(), 1);
     const std::string after_add = bk.hash();
 
-    exec(bk, 1000, 200);
+    exec(bk, 1000, 200);  // partial fill leaves the order in place
     EXPECT_EQ(bk.live(), 1);
-    EXPECT_NE(bk.hash(), after_add);
+    EXPECT_NE(bk.hash(), after_add);  // the remaining size is part of the hash
 
-    exec(bk, 1000, 300);
+    exec(bk, 1000, 300);  // the rest of it
     EXPECT_EQ(bk.live(), 0);
     EXPECT_EQ(bk.counters().executed, 2);
     EXPECT_EQ(bk.counters().orphan_ref, 0);
@@ -99,12 +101,14 @@ TEST(Book, cancel_and_delete) {
 
 TEST(Book, replace_keeps_side_and_security) {
     book::RefBook bk(64);
-    add(bk, 42, 200, 'S', 300, 999, 'F');
+    add(bk, 42, 200, 'S', 300, 999, 'F');  // an 'F' add carries an MPID
     replace(bk, 200, 201, 150, 1001);
     EXPECT_EQ(bk.live(), 1);
     EXPECT_EQ(bk.counters().replaced, 1);
     EXPECT_EQ(bk.counters().orphan_ref, 0);
 
+    // Rebuilding the same state directly must produce the same hash, which is
+    // only true if the replacement inherited side 'S' and locate 42.
     book::RefBook expect(64);
     add(expect, 42, 201, 'S', 150, 1001);
     EXPECT_EQ(bk.hash(), expect.hash());
@@ -136,7 +140,7 @@ TEST(Book, hash_is_insertion_order_independent) {
     book::RefBook c(64);
     add(c, 3, 100, 'B', 10, 700);
     add(c, 1, 101, 'S', 20, 800);
-    add(c, 2, 102, 'B', 31, 900);
+    add(c, 2, 102, 'B', 31, 900);  // one share different
     EXPECT_NE(a.hash(), c.hash());
 }
 
@@ -176,9 +180,11 @@ TEST(Book, live_by_locate_splits_the_market) {
     EXPECT_EQ(dist[5], 2);
     EXPECT_EQ(dist[9], 2);
     EXPECT_EQ(dist[0], 0);
+    // The whole market is the sum of its securities, never one of them.
     std::uint64_t total = 0;
     for (const std::uint32_t n : dist) total += n;
     EXPECT_EQ(total, bk.live());
 }
 
-}
+}  // namespace
+

@@ -33,6 +33,7 @@ TEST(Ring, what_goes_in_comes_out) {
     EXPECT_EQ(v.hw_ts, 123456789u);
     EXPECT_EQ(v.flags, 7u);
     EXPECT_EQ(r.published(), 1u);
+    // The one after it has not been written yet.
     EXPECT_EQ(r.take(2, &v), State::kWaiting);
 }
 
@@ -48,6 +49,8 @@ TEST(Ring, sequence_numbers_run_from_one) {
     }
 }
 
+// A reader far enough behind has had its message written over. Saying so is the
+// point: the alternative is handing back whatever now sits in the slot.
 TEST(Ring, a_reader_left_behind_is_told_so) {
     Ring r(4);
     const std::uint8_t byte = 0;
@@ -56,7 +59,7 @@ TEST(Ring, a_reader_left_behind_is_told_so) {
     View v;
     EXPECT_EQ(r.take(1, &v), State::kLapped);
     EXPECT_EQ(r.take(2, &v), State::kLapped);
-    EXPECT_EQ(r.take(3, &v), State::kReady);
+    EXPECT_EQ(r.take(3, &v), State::kReady);  // still in its slot
     EXPECT_EQ(r.take(6, &v), State::kReady);
     EXPECT_EQ(r.take(7, &v), State::kWaiting);
 }
@@ -67,14 +70,25 @@ TEST(Ring, slots_round_up_to_a_power_of_two) {
     EXPECT_EQ(Ring(65).slots(), 128u);
 }
 
+// The part that cannot be checked by reading the code: the store that publishes
+// the sequence has to make the payload visible with it. Run one writer and
+// several readers for real and have every reader verify the payload belongs to
+// the sequence it was told about.
 TEST(Ring, every_reader_sees_every_message_with_its_payload) {
     constexpr std::uint64_t kMessages = 200000;
     constexpr int kReaders = 3;
     Ring r(1u << 16);
 
+    // The payload each message points at is written just before it is
+    // published, so a reader that sees the sequence but not the payload will
+    // read the wrong value here.
     std::vector<std::uint64_t> payload(r.slots(), 0);
     std::atomic<bool> go{false};
     std::atomic<int> bad{0};
+    // How far each reader has got. The writer stays within a ring of the
+    // slowest one, because on a machine with fewer cores than threads a reader
+    // gets descheduled for long enough to be lapped - and whether a lapped
+    // reader is told so is a different test.
     std::vector<std::atomic<std::uint64_t>> at(kReaders);
     for (auto& a : at) a.store(0, std::memory_order_relaxed);
 
@@ -118,6 +132,8 @@ TEST(Ring, every_reader_sees_every_message_with_its_payload) {
     EXPECT_EQ(r.published(), kMessages);
 }
 
+// Two readers on one line would write to the same cache line on every message,
+// which is the thing the layout exists to avoid.
 TEST(Ring, each_reader_gets_a_line_of_its_own) {
     ring::Cursor c[2];
     EXPECT_EQ(sizeof(ring::Cursor), 64u);
@@ -127,4 +143,4 @@ TEST(Ring, each_reader_gets_a_line_of_its_own) {
     EXPECT_EQ(b - a, 64u);
 }
 
-}
+}  // namespace

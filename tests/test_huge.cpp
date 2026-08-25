@@ -1,3 +1,8 @@
+// The buffer the book lives in. What matters here is that it behaves like the
+// vector it replaced, and that when the machine has a pool of 2 MB pages the
+// memory really comes from it - a silent fall back to 4 KB pages would show up
+// only as a slower run.
+
 #include "common/huge.hpp"
 
 #include <gtest/gtest.h>
@@ -9,6 +14,8 @@
 
 namespace {
 
+// The page size the kernel is using for the mapping an address falls in, read
+// out of this process's own map. Zero if the address is in no mapping.
 std::size_t page_size_at(const void* p) {
     const auto want = reinterpret_cast<std::uintptr_t>(p);
     std::FILE* f = std::fopen("/proc/self/smaps", "r");
@@ -71,6 +78,8 @@ TEST(Huge, nothing_asked_for_is_not_an_error) {
     EXPECT_EQ(b.size(), 0u);
 }
 
+// PriceLevels is returned by value, so this is the property that keeps it
+// compiling as well as the one that keeps it correct.
 TEST(Huge, moving_carries_the_memory_across) {
     huge::Buffer<std::uint32_t> a;
     a.assign(64, 5u);
@@ -81,19 +90,29 @@ TEST(Huge, moving_carries_the_memory_across) {
     EXPECT_EQ(b[63], 5u);
 }
 
+// The pool is grown by the process that needs it and given back when it is
+// done, so the machine holds none between runs. Both halves matter: pages left
+// reserved are pages nothing else can use, and pages already there when a run
+// starts were taken when memory looked different.
+// The pool grows by exactly what was asked for and shrinks again afterwards, so
+// the machine holds no pages between runs. Only the growth can be pinned down
+// here - what comes back depends on what the other tests in this process are
+// still holding - and the end to end version of the check is in full_day.sh,
+// which refuses to start if any pages are already reserved.
 TEST(Huge, the_pool_grows_by_what_was_asked_for) {
     huge::bind_to(0);
     const std::size_t before = huge::pool_size();
     {
         huge::Buffer<std::uint64_t> b;
-        b.assign(1u << 20, 0u);
+        b.assign(1u << 20, 0u);  // 8 MB, four pages
         if (page_size_at(&b[0]) != huge::kPage) {
             GTEST_SKIP() << "cannot reserve pages here, so nothing to check";
         }
+        // Topped up to what is needed, not blindly added to.
         EXPECT_GE(huge::pool_size(), 4u);
     }
     huge::give_back();
     EXPECT_LE(huge::pool_size(), before);
 }
 
-}
+}  // namespace

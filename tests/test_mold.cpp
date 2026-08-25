@@ -30,10 +30,13 @@ TEST(Mold, header_roundtrip) {
     EXPECT_EQ(std::memcmp(p, kSession, mold::kSessionLen), 0);
     EXPECT_EQ(mold::sequence(p), 0x0123456789abcdefull);
     EXPECT_EQ(mold::count(p), 16);
+    // Big endian on the wire, whatever the host does.
     EXPECT_TRUE(p[mold::kSeqOff] == 0x01 && p[mold::kSeqOff + 7] == 0xef);
     EXPECT_TRUE(p[mold::kCountOff] == 0x00 && p[mold::kCountOff + 1] == 0x10);
 }
 
+// A packet carries the sequence of its first message, so the stream is gapless
+// only if the next packet starts at seq + count.
 TEST(Mold, sequence_has_no_holes) {
     mold::Packer packer(kSession, 1, 4);
     std::uint64_t expect = 1;
@@ -78,6 +81,8 @@ TEST(Mold, packer_fills_and_reparses) {
     EXPECT_TRUE(types.size() == 3 && types[0] == 'A' && types[1] == 'D');
 }
 
+// The headroom is where the Ethernet, IP and UDP headers go, so the MoldUDP64
+// header has to start after it and the payload must not shift.
 TEST(Mold, headroom_is_reserved_ahead_of_the_header) {
     const std::size_t headroom = 42;
     mold::Packer packer(kSession, 1, 2, headroom);
@@ -90,6 +95,8 @@ TEST(Mold, headroom_is_reserved_ahead_of_the_header) {
                       r.size()), 0);
 }
 
+// Renumbering the transport sequence must leave the order reference inside the
+// body alone.
 TEST(Mold, order_reference_is_copied_through) {
     mold::Packer packer(kSession, 999, 2);
     auto r = record('A', 0xdeadbeefcafe1234ull);
@@ -97,7 +104,8 @@ TEST(Mold, order_reference_is_copied_through) {
     const auto bytes = packer.seal();
     const std::uint8_t* body = bytes.data() + mold::kHeaderLen + itch::kLenPrefix;
     EXPECT_EQ(itch::read_be<std::uint64_t>(body + itch::kAddRefOff), 0xdeadbeefcafe1234ull);
-    EXPECT_EQ(mold::sequence(bytes.data()), 999);
+    EXPECT_EQ(mold::sequence(bytes.data()), 999);  // the two 8-byte fields differ
 }
 
-}
+}  // namespace
+

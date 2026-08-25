@@ -28,4 +28,5 @@ TEST(Sha256, incremental_matches_one_shot) {
     EXPECT_EQ(chunked.hex(), hash_of(data));
 }
 
-}
+}  // namespace
+

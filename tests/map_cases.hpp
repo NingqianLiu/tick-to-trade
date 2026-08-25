@@ -1,5 +1,9 @@
 #pragma once
 
+// The order map has two shapes, one chaining out of a pool and one open
+// addressing, and they have to behave identically or the comparison between
+// them means nothing. The cases live here once and each shape runs all of them.
+
 #include <gtest/gtest.h>
 
 #include <cstdint>
@@ -26,6 +30,8 @@ void a_stored_order_comes_back_whole() {
     EXPECT_EQ(o.price, 123450u);
     EXPECT_EQ(o.side, 0);
 
+    // The largest price the exchange published all day, next to the side bit
+    // that shares the same four bytes.
     ASSERT_TRUE(m.find(3, &o));
     EXPECT_EQ(o.shares, 7u);
     EXPECT_EQ(o.price, 1999999900u);
@@ -35,6 +41,8 @@ void a_stored_order_comes_back_whole() {
     EXPECT_EQ(m.size(), 2u);
 }
 
+// The widest values each field has to survive: a price of 2^31 - 1 and the
+// largest order the day contained.
 template <class Map>
 void the_fields_hold_their_extremes() {
     Map m(16);
@@ -53,7 +61,7 @@ void a_partial_fill_leaves_the_rest_resting() {
 
     typename Map::Order before{};
     ASSERT_TRUE(m.reduce(9, 200, &before));
-    EXPECT_EQ(before.shares, 500u);
+    EXPECT_EQ(before.shares, 500u);  // what was resting before this execution
     EXPECT_EQ(before.price, 100u);
 
     typename Map::Order o{};
@@ -62,6 +70,8 @@ void a_partial_fill_leaves_the_rest_resting() {
     EXPECT_EQ(m.size(), 1u);
 }
 
+// Four executions in five empty the order outright, and the exchange sends no
+// delete afterwards, so the entry has to disappear on its own.
 template <class Map>
 void a_full_fill_removes_the_order() {
     Map m(64);
@@ -75,6 +85,8 @@ void a_full_fill_removes_the_order() {
     EXPECT_FALSE(m.find(9, &o));
     EXPECT_EQ(m.size(), 0u);
 
+    // An execution larger than what is resting takes what is there, which is
+    // how the reference book treats one.
     m.insert(10, mk<Map>(50, 100, 0));
     ASSERT_TRUE(m.reduce(10, 999, &before));
     EXPECT_EQ(before.shares, 50u);
@@ -106,12 +118,16 @@ void it_refuses_to_grow() {
         if (!m.insert(k, mk<Map>(1, 10, 0))) break;
         ++stored;
     }
-    EXPECT_EQ(m.capacity(), cap);
+    EXPECT_EQ(m.capacity(), cap);  // still the size it was built at
     EXPECT_EQ(m.size(), stored);
     EXPECT_LE(stored, cap);
     EXPECT_GT(stored, 0u);
 }
 
+// Removal is where these go wrong. Open addressing has to pull entries back
+// into the hole or one that probed past it becomes unreachable; chaining has to
+// splice the node out and give it back without losing the rest of the chain.
+// Run a mixed workload against std::unordered_map and compare at every step.
 template <class Map>
 void it_matches_a_plain_map_under_churn() {
     Map m(1u << 14);
@@ -162,6 +178,8 @@ void it_matches_a_plain_map_under_churn() {
         ASSERT_EQ(m.size(), ref.size()) << "at step " << step;
     }
 
+    // Everything the plain map still holds must still be reachable here, with
+    // the same numbers.
     for (const auto& [oid, want] : ref) {
         typename Map::Order got{};
         ASSERT_TRUE(m.find(oid, &got)) << "lost " << oid;
@@ -171,4 +189,4 @@ void it_matches_a_plain_map_under_churn() {
     }
 }
 
-}
+}  // namespace cases

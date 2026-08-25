@@ -26,8 +26,16 @@ TEST(OrderMap, it_matches_a_plain_map_under_churn) {
     cases::it_matches_a_plain_map_under_churn<OrderMap>();
 }
 
+// Open addressing keeps colliding entries in the array itself, so a lookup
+// walks forward from the slot the key hashed to until it matches or reaches a
+// free slot. Removing an entry therefore cannot simply blank its slot: an entry
+// that walked past it would become unreachable. Force that exact shape by
+// filling one run of slots and taking the first of them away.
 TEST(OrderMap, a_removal_does_not_strand_what_probed_past_it) {
     OrderMap m(1024);
+    // Three references that genuinely land on the same slot, found by running
+    // the map's own arithmetic rather than assumed, so the case cannot quietly
+    // stop being a collision when the table size changes.
     int shift = 64;
     for (std::size_t c = m.capacity(); c > 1; c >>= 1) --shift;
     std::unordered_map<std::uint64_t, std::vector<std::uint64_t>> by_slot;
@@ -55,4 +63,4 @@ TEST(OrderMap, a_removal_does_not_strand_what_probed_past_it) {
     EXPECT_EQ(m.size(), 2u);
 }
 
-}
+}  // namespace

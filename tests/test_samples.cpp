@@ -19,6 +19,8 @@ TEST(Samples, samples_come_back_in_the_order_they_arrived) {
     EXPECT_EQ(log.over(), 0u);
 }
 
+// A run that quietly stopped recording would have its percentiles taken over
+// its early part alone, so the ones that did not fit have to be counted.
 TEST(Samples, what_did_not_fit_is_counted_rather_than_dropped_silently) {
     sample::Log log;
     log.reserve(2);
@@ -28,7 +30,7 @@ TEST(Samples, what_did_not_fit_is_counted_rather_than_dropped_silently) {
     log.add(4);
     EXPECT_EQ(log.size(), 2u);
     EXPECT_EQ(log.over(), 2u);
-    EXPECT_EQ(log.data()[1], 2u);
+    EXPECT_EQ(log.data()[1], 2u);  // the ones that fit are untouched
 }
 
 TEST(Samples, the_file_has_one_heading_and_one_number_per_line) {
@@ -66,4 +68,4 @@ TEST(Samples, an_empty_run_still_writes_a_file_with_its_heading) {
     std::fclose(f);
 }
 
-}
+}  // namespace

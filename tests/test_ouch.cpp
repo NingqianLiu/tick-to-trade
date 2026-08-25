@@ -14,6 +14,8 @@ std::uint64_t be(const std::uint8_t* p, std::size_t n) {
     return v;
 }
 
+// Every offset here comes from Nasdaq's own layout, so the point of this test
+// is that a later edit cannot quietly move a field.
 TEST(Ouch, the_fields_land_where_the_specification_puts_them) {
     std::vector<std::uint8_t> buf(ouch::kOrderPacketLen);
     ouch::prefill(buf.data());
@@ -21,6 +23,8 @@ TEST(Ouch, the_fields_land_where_the_specification_puts_them) {
     ouch::fill(buf.data(), 12345, ouch::kBuy, 1, symbol, 1234500);
     ouch::set_cl_ord_id(buf.data(), 987);
 
+    // The envelope counts what follows its own length field: one for the type
+    // and forty-seven for the order.
     EXPECT_EQ(be(buf.data(), 2), 48u);
     EXPECT_EQ(buf[2], 'U');
 
@@ -31,7 +35,7 @@ TEST(Ouch, the_fields_land_where_the_specification_puts_them) {
     EXPECT_EQ(be(m + ouch::kQuantityOff, 4), 1u);
     EXPECT_EQ(std::memcmp(m + ouch::kSymbolOff, symbol, 8), 0);
     EXPECT_EQ(be(m + ouch::kPriceOff, 8), 1234500u);
-    EXPECT_EQ(m[ouch::kTimeInForceOff], '3');
+    EXPECT_EQ(m[ouch::kTimeInForceOff], '3');  // immediate or cancel
     EXPECT_EQ(m[ouch::kDisplayOff], 'Y');
     EXPECT_EQ(m[ouch::kCapacityOff], 'P');
     EXPECT_EQ(m[ouch::kSweepOff], 'N');
@@ -47,10 +51,14 @@ TEST(Ouch, the_client_order_id_is_right_justified_and_padded) {
     const std::uint8_t* id = buf.data() + ouch::kSoupHeaderLen + ouch::kClOrdIdOff;
     EXPECT_EQ(std::memcmp(id, "           987", 14), 0);
 
+    // A wider one uses more of the field and still fills it exactly.
     ouch::set_cl_ord_id(buf.data(), 1304894064);
     EXPECT_EQ(std::memcmp(id, "    1304894064", 14), 0);
 }
 
+// A price read off the book goes into an order untouched, because both sides
+// count in hundredths of a cent. The largest the day contained is also the
+// largest the exchange accepts, so that value has to survive the trip.
 TEST(Ouch, a_price_off_the_book_needs_no_conversion) {
     std::vector<std::uint8_t> buf(ouch::kOrderPacketLen);
     ouch::prefill(buf.data());
@@ -58,10 +66,12 @@ TEST(Ouch, a_price_off_the_book_needs_no_conversion) {
     ouch::fill(buf.data(), 1, ouch::kSell, 1, symbol, ouch::kHighestPrice);
     const std::uint8_t* m = buf.data() + ouch::kSoupHeaderLen;
     EXPECT_EQ(be(m + ouch::kPriceOff, 8), 1999999900u);
-    EXPECT_EQ(ouch::kHighestPrice, 1999999900u);
+    EXPECT_EQ(ouch::kHighestPrice, 1999999900u);  // $199,999.99
     EXPECT_EQ(m[ouch::kSideOff], 'S');
 }
 
+// Filling one order must not disturb what the previous one left behind, since
+// the buffer is written once at start up and reused for every order after.
 TEST(Ouch, a_second_order_overwrites_only_what_changes) {
     std::vector<std::uint8_t> buf(ouch::kOrderPacketLen);
     ouch::prefill(buf.data());
@@ -75,6 +85,7 @@ TEST(Ouch, a_second_order_overwrites_only_what_changes) {
     EXPECT_EQ(m[ouch::kSideOff], 'S');
     EXPECT_EQ(std::memcmp(m + ouch::kSymbolOff, b, 8), 0);
     EXPECT_EQ(be(m + ouch::kPriceOff, 8), 200u);
+    // Everything the first order did not touch is still what prefill wrote.
     EXPECT_EQ(m[ouch::kTimeInForceOff], '3');
     EXPECT_EQ(m[ouch::kCapacityOff], 'P');
     EXPECT_EQ(be(buf.data(), 2), 48u);
@@ -83,12 +94,12 @@ TEST(Ouch, a_second_order_overwrites_only_what_changes) {
 TEST(Ouch, the_login_says_how_long_it_is) {
     std::vector<std::uint8_t> buf(ouch::kLoginLen);
     ouch::login(buf.data(), "user", "secret");
-    EXPECT_EQ(be(buf.data(), 2), 47u);
+    EXPECT_EQ(be(buf.data(), 2), 47u);  // everything after the length field
     EXPECT_EQ(buf[2], 'L');
     EXPECT_EQ(std::memcmp(buf.data() + 3, "user  ", 6), 0);
     EXPECT_EQ(std::memcmp(buf.data() + 9, "secret    ", 10), 0);
-    EXPECT_EQ(std::memcmp(buf.data() + 19, "          ", 10), 0);
+    EXPECT_EQ(std::memcmp(buf.data() + 19, "          ", 10), 0);  // any session
     EXPECT_EQ(buf[38], '1');
 }
 
-}
+}  // namespace

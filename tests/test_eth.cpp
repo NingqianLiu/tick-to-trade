@@ -12,6 +12,8 @@ const eth::Endpoint kSrc{{0x00, 0x0f, 0x53, 0x42, 0xfd, 0x50},
 const eth::Endpoint kDst{{0x01, 0x00, 0x5e, 0x36, 0x0c, 0x6f},
                          eth::ipv4(233, 54, 12, 111), 26477};
 
+// The worked example from the IPv4 header checksum definition, with the
+// checksum field zeroed as the sender leaves it while computing.
 TEST(Eth, the_checksum_matches_the_published_example) {
     const std::uint8_t header[20] = {0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40,
                                      0x00, 0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8,
@@ -19,6 +21,8 @@ TEST(Eth, the_checksum_matches_the_published_example) {
     EXPECT_EQ(eth::checksum(header, sizeof(header)), 0xb861);
 }
 
+// What a receiver does: run the sum over the header with its checksum in
+// place and expect zero.
 TEST(Eth, a_written_header_checks_out_as_zero) {
     std::uint8_t frame[eth::kHeaderBytes] = {};
     for (std::size_t payload : {0u, 1u, 34u, 511u, 1452u}) {
@@ -33,8 +37,9 @@ TEST(Eth, the_lengths_count_what_follows_each_header) {
     eth::write(frame, kSrc, kDst, 1452);
     const std::uint8_t* ip = frame + eth::kEthernetBytes;
     const std::uint8_t* udp = ip + eth::kIpBytes;
-    EXPECT_EQ((ip[2] << 8) | ip[3], 20 + 8 + 1452);
-    EXPECT_EQ((udp[4] << 8) | udp[5], 8 + 1452);
+    EXPECT_EQ((ip[2] << 8) | ip[3], 20 + 8 + 1452);  // IP covers itself and down
+    EXPECT_EQ((udp[4] << 8) | udp[5], 8 + 1452);     // UDP covers itself and down
+    // A full frame stays inside the 1500 byte limit it was sized against.
     EXPECT_EQ(((ip[2] << 8) | ip[3]), 1480);
 }
 
@@ -47,14 +52,16 @@ TEST(Eth, the_fields_land_where_the_wire_format_puts_them) {
 
     const std::uint8_t* ip = frame + eth::kEthernetBytes;
     EXPECT_EQ(ip[0], 0x45);
-    EXPECT_EQ(ip[6] & 0x40, 0x40);
-    EXPECT_EQ(ip[9], 17);
+    EXPECT_EQ(ip[6] & 0x40, 0x40);  // don't fragment
+    EXPECT_EQ(ip[9], 17);           // UDP
     EXPECT_EQ(ip[12], 10);
     EXPECT_EQ(ip[19], 111);
 
     const std::uint8_t* udp = ip + eth::kIpBytes;
     EXPECT_EQ((udp[0] << 8) | udp[1], 40000);
     EXPECT_EQ((udp[2] << 8) | udp[3], 26477);
+    // Left at zero on purpose: IPv4 allows it, and the MoldUDP64 sequence is
+    // what the run is actually checked against.
     EXPECT_EQ((udp[6] << 8) | udp[7], 0);
 }
 
@@ -64,11 +71,14 @@ TEST(Eth, a_multicast_group_maps_onto_its_mac) {
     const std::uint8_t want[] = {0x01, 0x00, 0x5e, 0x36, 0x0c, 0x6f};
     EXPECT_EQ(std::memcmp(mac, want, sizeof(want)), 0);
 
+    // Only 23 of the address bits reach the MAC, so these two share one.
     std::uint8_t other[eth::kMacBytes] = {};
     eth::multicast_mac(eth::ipv4(233, 182, 12, 111), other);
     EXPECT_EQ(std::memcmp(mac, other, sizeof(mac)), 0);
 }
 
+// Two feeds differ only in where they are addressed, which is what lets the
+// receiver count them apart while arbitrating purely on the sequence.
 TEST(Eth, the_two_feeds_differ_only_in_the_destination) {
     std::uint8_t a[eth::kHeaderBytes] = {};
     std::uint8_t b[eth::kHeaderBytes] = {};
@@ -80,4 +90,4 @@ TEST(Eth, the_two_feeds_differ_only_in_the_destination) {
     EXPECT_EQ(std::memcmp(a, b, eth::kEthernetBytes + eth::kIpBytes + 2), 0);
 }
 
-}
+}  // namespace

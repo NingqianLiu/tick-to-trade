@@ -26,6 +26,10 @@ TEST(PoolMap, it_matches_a_plain_map_under_churn) {
     cases::it_matches_a_plain_map_under_churn<PoolMap>();
 }
 
+// A freed node goes back on the front of the list, so the next order to arrive
+// gets the node just given up rather than a cold one from further along. That
+// is the whole reason for the pool, so pin it: fill the block, hand one back,
+// and the next insert must land on the node that was released.
 TEST(PoolMap, a_released_node_is_the_next_one_handed_out) {
     PoolMap m(16);
     const std::size_t cap = m.capacity();
@@ -33,6 +37,7 @@ TEST(PoolMap, a_released_node_is_the_next_one_handed_out) {
         ASSERT_TRUE(m.insert(k, cases::mk<PoolMap>(1, 10, 0)));
     }
     EXPECT_EQ(m.size(), cap);
+    // Nothing left to hand out.
     EXPECT_FALSE(m.insert(cap + 1, cases::mk<PoolMap>(1, 10, 0)));
 
     PoolMap::Order gone{};
@@ -46,6 +51,10 @@ TEST(PoolMap, a_released_node_is_the_next_one_handed_out) {
     EXPECT_EQ(o.shares, 2u);
 }
 
+// The slot API exists so a caller can look an order up once and come back to it
+// later, after other messages in the same batch have been applied. That only
+// holds if a slot never moves, so pin it: take a slot, churn the table around
+// it, and the slot must still describe the same order.
 TEST(PoolMap, a_slot_keeps_pointing_at_its_order_through_churn) {
     PoolMap m(64);
     const std::uint32_t slot = m.insert_at(1000, PoolMap::Order{50, 777, 1, 9});
@@ -66,6 +75,8 @@ TEST(PoolMap, a_slot_keeps_pointing_at_its_order_through_churn) {
     EXPECT_EQ(o.sym, 9u);
 }
 
+// insert_at and find_slot have to agree, otherwise the two halves of a replace
+// would work on different rows.
 TEST(PoolMap, find_slot_returns_what_insert_at_handed_out) {
     PoolMap m(64);
     const std::uint32_t slot = m.insert_at(42, PoolMap::Order{5, 100, 0, 3});
@@ -74,6 +85,9 @@ TEST(PoolMap, find_slot_returns_what_insert_at_handed_out) {
     EXPECT_EQ(m.find_slot(43), PoolMap::kNoSlot);
 }
 
+// A replace arrives without a side, so the new order is created blank and the
+// side and symbol are filled in later from the order it replaces. Filling them
+// in must not disturb the shares and price that came off the wire.
 TEST(PoolMap, set_side_sym_at_fills_the_blanks_and_leaves_the_rest) {
     PoolMap m(64);
     const std::uint32_t slot = m.insert_at(7, PoolMap::Order{200, 12345, 0, 0});
@@ -88,6 +102,7 @@ TEST(PoolMap, set_side_sym_at_fills_the_blanks_and_leaves_the_rest) {
     EXPECT_EQ(o.price, 12345u);
 }
 
+// A partial fill only moves the share count.
 TEST(PoolMap, set_shares_at_leaves_the_rest_alone) {
     PoolMap m(64);
     const std::uint32_t slot = m.insert_at(7, PoolMap::Order{200, 12345, 1, 501});
@@ -102,6 +117,9 @@ TEST(PoolMap, set_shares_at_leaves_the_rest_alone) {
     EXPECT_EQ(o.sym, 501u);
 }
 
+// erase_at has to unlink the node from its bucket and give it back to the free
+// list, exactly like erase by id does. If it only did one of the two the table
+// would either leak nodes or keep answering finds for a dead order.
 TEST(PoolMap, erase_at_removes_the_order_and_returns_the_node) {
     PoolMap m(64);
     const std::size_t before = m.size();
@@ -118,6 +136,8 @@ TEST(PoolMap, erase_at_removes_the_order_and_returns_the_node) {
     EXPECT_NE(m.insert_at(8, PoolMap::Order{1, 1, 0, 0}), PoolMap::kNoSlot);
 }
 
+// The same order id arriving twice overwrites in place rather than taking a
+// second node, so the slot the caller already holds stays valid.
 TEST(PoolMap, insert_at_overwrites_in_place_for_a_repeated_id) {
     PoolMap m(64);
     const std::uint32_t first = m.insert_at(7, PoolMap::Order{200, 12345, 1, 501});
@@ -131,6 +151,8 @@ TEST(PoolMap, insert_at_overwrites_in_place_for_a_repeated_id) {
     EXPECT_EQ(m.at(first).shares, 9u);
 }
 
+// Running out of nodes has to be reported, not papered over: the seven passes
+// carry the returned slot around and would write through a bad one.
 TEST(PoolMap, insert_at_says_no_slot_when_the_nodes_run_out) {
     PoolMap m(16);
     const std::size_t cap = m.capacity();
@@ -140,4 +162,4 @@ TEST(PoolMap, insert_at_says_no_slot_when_the_nodes_run_out) {
     EXPECT_EQ(m.insert_at(cap + 1, PoolMap::Order{1, 10, 0, 0}), PoolMap::kNoSlot);
 }
 
-}
+}  // namespace

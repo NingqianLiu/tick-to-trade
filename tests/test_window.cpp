@@ -12,12 +12,16 @@ constexpr std::uint64_t kUnit = std::uint64_t{1} << win::kDefaultShift;
 constexpr std::uint64_t kPeriod = kUnit * (win::kDefaultMask + 1);
 constexpr std::uint64_t kSlot = win::kDefaultSlot;
 
+// The stateless predicate is the definition; the tracker is an optimisation of
+// it. If they ever disagree the sender and the receiver would record different
+// nanoseconds, and nothing in the protocol would notice.
 void agrees_over_a_day(const win::Params& p) {
     win::Tracker t(p);
     t.open_session(0);
     for (std::uint64_t ts = 0; ts < 23400ull * 1000000000ull; ts += 1000000) {
         EXPECT_EQ((t.advance(ts) == win::Phase::kWindow), p.in_window(ts));
     }
+    // Every unit boundary of the first few periods, to the nanosecond.
     win::Tracker fine(p);
     fine.open_session(0);
     for (std::uint64_t k = 0; k < 3; ++k) {
@@ -32,6 +36,8 @@ void agrees_over_a_day(const win::Params& p) {
 
 TEST(Window, tracker_agrees_with_the_predicate) {
     agrees_over_a_day(kDefault);
+    // The three numbers are knobs, so the agreement has to hold off the
+    // defaults too: a shorter unit, a shorter period and a different slot.
     agrees_over_a_day(win::Params{27, 15, 0, 0, 0});
     agrees_over_a_day(win::Params{31, 63, 63, 0, 0});
 }
@@ -39,14 +45,19 @@ TEST(Window, tracker_agrees_with_the_predicate) {
 TEST(Window, window_geometry) {
     EXPECT_EQ(kDefault.unit_ns(), 1073741824ull);
     EXPECT_EQ(kDefault.period_ns(), 34359738368ull);
+    // The first unit of every period, and nothing else.
     EXPECT_TRUE(kDefault.in_window(kSlot * kUnit));
     EXPECT_TRUE(kDefault.in_window((kSlot + 1) * kUnit - 1));
     EXPECT_FALSE(kDefault.in_window((kSlot + 1) * kUnit));
     EXPECT_FALSE(kDefault.in_window(kPeriod + kSlot * kUnit - 1));
     EXPECT_TRUE(kDefault.in_window(kPeriod + kSlot * kUnit));
 
-    constexpr std::uint64_t kOpen = 34200ull * 1000000000ull;
-    constexpr std::uint64_t kShut = 57600ull * 1000000000ull;
+    // The regular session holds 681 windows and records 731 s of it. Counted
+    // the way the tracker gates them - a window is in if it overlaps the
+    // session at all - so that the answer does not depend on which unit of the
+    // period is picked.
+    constexpr std::uint64_t kOpen = 34200ull * 1000000000ull;   // 09:30
+    constexpr std::uint64_t kShut = 57600ull * 1000000000ull;   // 16:00
     std::uint64_t windows = 0;
     for (std::uint64_t u = 0; u * kUnit < kShut + kPeriod; ++u) {
         const std::uint64_t open = u * kUnit;
@@ -56,28 +67,36 @@ TEST(Window, window_geometry) {
 }
 
 TEST(Window, settle_and_tail_bracket_the_window) {
-    const std::uint64_t settle = 100ull * 1000000;
-    const std::uint64_t tail = 2ull * 1000000;
+    const std::uint64_t settle = 100ull * 1000000;  // 100 ms
+    const std::uint64_t tail = 2ull * 1000000;      // 2 ms
     win::Params p = kDefault;
     p.settle_ns = settle;
     p.tail_ns = tail;
     win::Tracker t(p);
     t.open_session(0);
+    // The second period, so that the settle period before the window has
+    // somewhere to be even when the recorded unit is the first of a period.
     const std::uint64_t open = kPeriod + kSlot * kUnit;
     EXPECT_EQ(t.advance(open - settle - 1), win::Phase::kGap);
     EXPECT_EQ(t.advance(open - settle), win::Phase::kSettle);
     EXPECT_EQ(t.advance(open - 1), win::Phase::kSettle);
     EXPECT_EQ(t.advance(open), win::Phase::kWindow);
     EXPECT_EQ(t.advance(open + kUnit - 1), win::Phase::kWindow);
+    // The window is over, but the original spacing carries on for the tail so
+    // the last samples are not queued behind the fixed-rate stretch.
     EXPECT_EQ(t.advance(open + kUnit), win::Phase::kTail);
     EXPECT_EQ(t.advance(open + kUnit + tail - 1), win::Phase::kTail);
     EXPECT_EQ(t.advance(open + kUnit + tail), win::Phase::kGap);
+    // Only the window itself is recorded; everything else is sent the same way
+    // but thrown away.
     EXPECT_FALSE(win::Tracker::one_to_one(win::Phase::kGap));
     EXPECT_TRUE(win::Tracker::one_to_one(win::Phase::kSettle));
     EXPECT_TRUE(win::Tracker::one_to_one(win::Phase::kWindow));
     EXPECT_TRUE(win::Tracker::one_to_one(win::Phase::kTail));
 }
 
+// The tail belongs to the window it follows, so the boundary must not roll over
+// until the tail is done or the next window's index arrives early.
 TEST(Window, tail_does_not_move_the_boundary_early) {
     win::Params p = kDefault;
     p.settle_ns = 0;
@@ -93,28 +112,38 @@ TEST(Window, tail_does_not_move_the_boundary_early) {
     EXPECT_EQ(t.index(), 1);
 }
 
+// Outside the regular session nothing is recorded, so nothing is replayed at
+// the original speed either: those 995 windows would cost 26 minutes a run and
+// produce no samples.
 TEST(Window, only_the_regular_session_is_replayed_one_to_one) {
+    // Closed until the stream says otherwise.
     win::Tracker shut(kDefault);
     EXPECT_EQ(shut.advance(kSlot * kUnit), win::Phase::kGap);
     const std::uint64_t open = kSlot * kUnit;
 
     win::Tracker gated(kDefault);
-    gated.open_session(kPeriod);
+    gated.open_session(kPeriod);          // the session starts after window 0
     gated.close_session(3 * kPeriod);
     EXPECT_EQ(gated.advance(open), win::Phase::kGap);
 
     EXPECT_EQ(gated.advance(kPeriod + open), win::Phase::kWindow);
     EXPECT_EQ(gated.advance(2 * kPeriod + open), win::Phase::kWindow);
     EXPECT_EQ(gated.advance(3 * kPeriod + open), win::Phase::kGap);
+    // The window index keeps counting either way, so the two ends agree on
+    // which window they are standing in.
     EXPECT_EQ(gated.index(), 3);
 }
 
+// A window inside the session keeps its settle period and its tail even where
+// those reach outside it, because they are replayed to serve that window.
 TEST(Window, the_gate_follows_the_window_not_the_message) {
     win::Params p = kDefault;
     p.settle_ns = 500ull * 1000000;
     p.tail_ns = 10ull * 1000000;
     win::Tracker t(p);
     const std::uint64_t open = kPeriod + kSlot * kUnit;
+    // The session starts inside the settle period and ends inside the tail, so
+    // by the message the ends would fall outside; by the window they do not.
     t.open_session(open - 1);
     t.close_session(open + kUnit + 1);
     EXPECT_EQ(t.advance(open - p.settle_ns), win::Phase::kSettle);
@@ -122,6 +151,7 @@ TEST(Window, the_gate_follows_the_window_not_the_message) {
     EXPECT_EQ(t.advance(open + kUnit + p.tail_ns - 1), win::Phase::kTail);
 }
 
+// The boundaries come out of the stream, never off a clock.
 TEST(Window, the_session_boundaries_come_from_the_system_events) {
     win::Tracker t(kDefault);
     std::uint8_t body[12] = {};
@@ -139,6 +169,7 @@ TEST(Window, the_session_boundaries_come_from_the_system_events) {
     EXPECT_EQ(t.advance(open), win::Phase::kGap);
     EXPECT_EQ(t.advance(kPeriod + open), win::Phase::kWindow);
     EXPECT_EQ(t.advance(3 * kPeriod + open), win::Phase::kGap);
+    // Any other system event leaves the gate where it is.
     stamp(4 * kPeriod, itch::kEventStartOfSystemHours);
     EXPECT_EQ(t.advance(4 * kPeriod + open), win::Phase::kGap);
 }
@@ -148,13 +179,15 @@ TEST(Window, index_counts_windows) {
     t.open_session(0);
     EXPECT_EQ(t.index(), 0);
     (void)t.advance(kSlot * kUnit);
-    EXPECT_EQ(t.index(), 0);
+    EXPECT_EQ(t.index(), 0);  // still standing in the first window
     (void)t.advance(kPeriod + kSlot * kUnit);
     EXPECT_EQ(t.index(), 1);
     (void)t.advance(680 * kPeriod + kSlot * kUnit);
     EXPECT_EQ(t.index(), 680);
 }
 
+// Both ends read these from the environment and never talk to each other, so a
+// typo has to be visible here rather than in the results a day later.
 TEST(Window, env_overrides) {
     EXPECT_EQ(win::params_from_env().slot, win::kDefaultSlot);
     EXPECT_EQ(win::params_from_env().settle_ns, win::kDefaultSettleMs * 1000000);
@@ -179,4 +212,5 @@ TEST(Window, env_overrides) {
     unsetenv("ITCH_WINDOW_TAIL_MS");
 }
 
-}
+}  // namespace
+

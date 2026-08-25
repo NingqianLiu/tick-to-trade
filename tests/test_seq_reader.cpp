@@ -11,6 +11,8 @@
 
 namespace {
 
+// Writes framed records whose bodies differ in length, so records land across
+// read boundaries at many different offsets.
 std::string write_sample(std::size_t records) {
     const std::string path =
         (std::filesystem::temp_directory_path() / "seq_reader_test.bin").string();
@@ -43,7 +45,7 @@ std::size_t count_with_buffer(const std::string& path, std::size_t cap,
         reader.consume(r.consumed);
         if (r.consumed == 0) break;
     }
-    EXPECT_EQ(reader.size(), 0);
+    EXPECT_EQ(reader.size(), 0);  // a clean file leaves no partial tail
     *bytes = reader.total_bytes();
     return seen;
 }
@@ -54,6 +56,8 @@ TEST(SeqReader, buffer_sizes_agree) {
     EXPECT_FALSE(path.empty());
     const auto file_size = std::filesystem::file_size(path);
 
+    // The longest record here is 2 + 40 bytes. A 48-byte buffer only just
+    // holds it, so the carry-over path runs on nearly every refill.
     for (std::size_t cap : {48u, 64u, 4096u, 1u << 20}) {
         std::uint64_t bytes = 0;
         EXPECT_EQ(count_with_buffer(path, cap, &bytes), records);
@@ -62,6 +66,9 @@ TEST(SeqReader, buffer_sizes_agree) {
     std::filesystem::remove(path);
 }
 
+// The reader carries a partial record forward, so it cannot make progress on a
+// record longer than its own buffer. Production uses a 32 MB buffer against a
+// 52-byte maximum message, but the limit should be visible rather than assumed.
 TEST(SeqReader, buffer_must_exceed_the_longest_record) {
     const std::string path = write_sample(200);
     io::SeqReader reader(path.c_str(), 16);
@@ -70,6 +77,7 @@ TEST(SeqReader, buffer_must_exceed_the_longest_record) {
     const auto r = itch::for_each_message(reader.data(), reader.size(),
                                           [](const itch::Message&) { return true; });
     reader.consume(r.consumed);
+    // Records 12 and 13 bytes long fit; the buffer stalls once they grow.
     std::size_t stalled_at = 0;
     while (reader.fill()) {
         const auto step = itch::for_each_message(
@@ -89,4 +97,5 @@ TEST(SeqReader, missing_file) {
     EXPECT_FALSE(reader.ok());
 }
 
-}
+}  // namespace
+
