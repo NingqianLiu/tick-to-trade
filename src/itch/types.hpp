@@ -13,16 +13,8 @@
 // defining them twice in the same translation unit.
 #pragma once
 
-// <array> gives the fixed 256 entry message length table, so an ASCII type can be turned
-// straight into an index.
-// A fixed size lets the whole table be built at compile time, and looking a type up at run
-// time is a single array access.
 #include <array>
-// <cstddef> gives std::size_t, used here for byte lengths and field offsets.
-// size_t also adds to a body pointer directly, with no conversion at each call site.
 #include <cstddef>
-// <cstdint> gives uint8_t; every ITCH body length fits in one byte.
-// The explicit one byte type also keeps the whole length table at exactly 256 bytes.
 #include <cstdint>
 
 // All of these constants describe the ITCH wire format, so they live in the itch

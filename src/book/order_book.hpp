@@ -19,10 +19,7 @@
 // alarm. Anything other than zero means a lost packet or a bug, and it is one of the
 // three numbers that decide whether a run can be used at all.
 
-// Fixed width integers: security numbers, shares, prices and order ids all have a size
-// the protocol fixes.
 #include <cstdint>
-// std::vector, for the table of reference prices the constructor takes.
 #include <vector>
 
 // Three order table implementations with the same interface. The using line below picks

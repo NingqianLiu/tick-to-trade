@@ -23,25 +23,17 @@
 // program needs - there is no rate limiting code here. So "the producer might overwhelm
 // the consumer" is not a real worry: it physically cannot exceed 10 Gb/s.
 
-// sched_getcpu and sched_setaffinity, to pin the sending thread. It sends hundreds of
-// thousands of packets a second, and being moved once by the scheduler leaves a visible
-// gap.
 #include <sched.h>
 
 // The ef_vi declarations. What is used here is ef_event, ef_vi_transmit_init,
 // ef_vi_transmit_push and ef_vi_transmit_unbundle - the whole send path.
 #include <etherfabric/ef_vi.h>
 
-// PRIu64 and friends: the report at the end is full of 64 bit counts.
 #include <cinttypes>
 #include <cstdio>
-// strtoull and exit, for the command line.
 #include <cstdlib>
-// memcpy to move a message into a frame untouched, strcmp to recognise a flag.
 #include <cstring>
-// The session name and the file path.
 #include <string>
-// The directory of built frames.
 #include <vector>
 
 // hist::Hist. What is measured here is not latency but how far the moment a packet was

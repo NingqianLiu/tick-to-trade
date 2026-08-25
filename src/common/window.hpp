@@ -16,13 +16,9 @@
 // own results, so a mismatch shows up afterwards instead of quietly becoming two different
 // experiments.
 
-// Every time and length here is 64 bit nanoseconds.
 #include <cstdint>
-// strchr and strlen, for counting how many decimal places a millisecond was written with.
 #include <cstring>
-// sscanf for "10:58:30.100", and fprintf for the error when a parameter is impossible.
 #include <cstdio>
-// getenv and strtoull to read the environment, exit to refuse bad parameters.
 #include <cstdlib>
 
 // Message::timestamp() and its body, for recognising the session events below.

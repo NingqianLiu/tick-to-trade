@@ -21,7 +21,6 @@
 // hits. The difference is not a few percent - it is whether each packet takes an extra
 // trip.
 
-// munmap. Getting huge pages is common/huge.hpp's job; only giving them back happens here.
 #include <sys/mman.h>
 
 // ef_driver_open, ef_driver_close and the ef_driver_handle type.
@@ -51,10 +50,7 @@
 #include <etherfabric/vi.h>
 
 #include <cstddef>
-// Buffers are addressed as bytes, so the base pointer is std::uint8_t*.
 #include <cstdint>
-// Every failure in this file prints one line and returns false. All of this happens before
-// a run starts, so the caller simply exits; the hot path never reaches any of it.
 #include <cstdio>
 
 // huge::map asks for memory in huge pages, and huge::must_be_local checks it landed on the

@@ -28,11 +28,8 @@
 // hundred above twenty microseconds, and a percentile that falls outside the buckets is not
 // a measurement - it is a shrug.
 
-// std::array: the bucket count is fixed at compile time, and handing the whole block out
-// carries its length with it.
 #include <array>
 #include <cstddef>
-// Nanoseconds and counts. A 32 bit count would overflow over a full day.
 #include <cstdint>
 
 namespace hist {

@@ -17,18 +17,12 @@
 // byte write into memory that was touched before the run started; the file is not opened
 // until the last packet has gone by.
 
-// mkdir. The output directory may not exist yet.
 #include <sys/stat.h>
 
-// errno and EEXIST: a directory that already exists is not a failure.
 #include <cerrno>
-// std::uint64_t - a sample is a count of nanoseconds.
 #include <cstdint>
-// std::FILE and the stdio calls that write the csv.
 #include <cstdio>
-// std::string, for joining a directory and a file name.
 #include <string>
-// std::vector, the buffer itself.
 #include <vector>
 
 namespace sample {

@@ -20,22 +20,10 @@
 // card - finding the peer's address, the handshake, polling for acknowledgements - lives in
 // the tool that drives it. Split that way, this half is pinned down by unit tests.
 
-// std::atomic. The thread that sends orders and the thread that reads acknowledgements each
-// write different fields of this connection: one moves "how far we have sent", the other
-// moves "how far they have acknowledged" and "how much they can still take". The fields do
-// not overlap, but each side reads what the other writes, so those have to be atomic.
-//
-// The most relaxed ordering is enough: all that is needed is reading a whole value rather
-// than half of one, with no ordering implied - and on x86 a relaxed atomic load or store is
-// an ordinary move, costing nothing.
 #include <atomic>
 #include <cstddef>
-// Fixed widths, including the signed 32 bit type the sequence comparison needs - see
-// before() below.
 #include <cstdint>
-// memcpy for the template, memset for clearing it in open().
 #include <cstring>
-// std::move, for moving a connection.
 #include <utility>
 
 // eth::Endpoint - one end's MAC, IP and port - and eth::kMacBytes. Only the types and the

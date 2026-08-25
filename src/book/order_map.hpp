@@ -36,13 +36,8 @@
 // what to take off the price level when the order goes away. A replace is the same, and
 // its new order inherits the side and the security from the one it replaces.
 
-// std::size_t for slot counts, indexes and the mask. This table can hold tens of
-// millions of slots, which an int would not.
 #include <cstddef>
-// An order id is eight bytes; shares and price are four each.
 #include <cstdint>
-// std::vector. Every slot is allocated once in the constructor and the table never grows
-// afterwards - see below for why.
 #include <vector>
 
 namespace book {

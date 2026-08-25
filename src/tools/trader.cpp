@@ -43,41 +43,16 @@
 //
 //   ip netns exec trader ./build/trader --reference results/prev_close_121225.csv
 
-// htons and htonl, which put an integer in the order the wire uses. The card's filters
-// want it that way: the port and the address below both go through them before being
-// handed over.
 #include <arpa/inet.h>
-// IPPROTO_UDP and IPPROTO_TCP. A filter has to name the protocol it wants: UDP for the
-// market data, TCP for the acknowledgements.
 #include <netinet/in.h>
-// TCP_NODELAY and the other kernel socket options. Not one is used here - our TCP is our
-// own and never goes through the kernel, so there is no socket to set anything on. It
-// still compiles without this; it simply has not been cleared out.
 #include <netinet/tcp.h>
-// pthread_self and pthread_setaffinity_np, which pin() below uses to fix a thread to one
-// core.
 #include <pthread.h>
-// cpu_set_t and the CPU_ZERO and CPU_SET macros that fill it in: pin() clears the set,
-// lights the one bit it wants and passes it to the call above.
 #include <sched.h>
-// mallopt, for changing how the allocator behaves. It is called twice at start up: once
-// to stop freed memory being handed back to the system, once to keep large allocations
-// off mmap. Both have the same purpose - never go to the kernel for a page during a run.
 #include <malloc.h>
-// mlockall with MCL_CURRENT and MCL_FUTURE, which pins every page of the process in
-// physical memory. It is off by default (the lock_memory option is never set) and the
-// code is kept.
 #include <sys/mman.h>
-// mkdir, for creating the directory before the statistics are written.
 #include <sys/stat.h>
-// socket() and bind(). None of them is used here either - where socket appears in this
-// file it is in a comment, as a comparison. Another include left over.
 #include <sys/socket.h>
-// iovec and writev, for writing several pieces at once. Also unused: a frame is filled by
-// copying bytes into a send slot.
 #include <sys/uio.h>
-// close and read. Not used directly any more either - the reference prices are read with
-// fopen and fgets - but other system headers want it and it costs nothing.
 #include <unistd.h>
 
 // The Onload extension interface, the onload_ functions. None is used any more: the order
@@ -99,40 +74,17 @@
 // ef_vi_start_transmit_warm and stop (a send that goes nowhere, to warm the path).
 #include <etherfabric/vi.h>
 
-// std::atomic. Only three things are shared between the two threads: a flag saying the
-// run is over, how much has been drained, and one counter. Atomics rather than a lock,
-// because nothing on the hot path may be able to go to sleep.
 #include <atomic>
-// PRIu64 and friends. The format for a 64 bit integer differs between platforms, so
-// writing %lu breaks on the next machine. Thirty odd lines of statistics use these.
 #include <cinttypes>
-// fopen, fgets, fprintf and fclose, for reading the reference prices and the symbol list,
-// and for writing the csv files and the log at the end.
 #include <cstdio>
-// strtoul, atoi and abort: the first two for the command line and the prices, abort for
-// stopping outright when pinning a thread fails.
 #include <cstdlib>
-// memcpy, memset, strcmp, strchr and strerror - comparing flag names, cutting a csv line,
-// copying bytes into a send slot.
 #include <cstring>
-// std::min and std::max, used only in the wrap up: finding the worst window and clamping
-// an index.
 #include <algorithm>
-// std::unique_ptr and std::make_unique. The shard structure is hundreds of megabytes,
-// which would overflow the stack, so it lives on the heap.
 #include <memory>
-// std::string, the key when reference prices are looked up by ticker, and for building
-// output paths.
 #include <string>
-// std::thread. Exactly one extra thread is started: the one that reads acknowledgements.
 #include <thread>
-// The hash table used at start up to map a ticker to its previous close. Only at start
-// up - it allocates, which is the last thing wanted on a hot path.
 #include <unordered_map>
-// The set of tickers to trade, asked once per security as the exchange names them.
 #include <unordered_set>
-// std::vector, which is nearly every block of memory sized by a count here: the price
-// table, a row per window, and the parallel rows of raw samples.
 #include <vector>
 
 // book::Imbalance, the signal: how far apart the shares on the best three prices of each
@@ -1118,7 +1070,6 @@ bool parse_ip(const char* s, std::uint32_t* out) {
     return true;
 }
 
-
 // Opens an interface used only for sending orders.
 // It is entirely separate from the one receiving market data: not a byte is sent on that
 // one, and not a byte is received on this one - the acknowledgements coming back use a
@@ -2002,6 +1953,7 @@ void warm(Shard* self) {
     // Counted, and printed at the end, to confirm this really is happening.
     ++self->warmed;
 }
+
 
 // This is the other end of the whole measurement.
 //
