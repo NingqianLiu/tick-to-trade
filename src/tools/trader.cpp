@@ -203,10 +203,6 @@ struct Shard {
     std::uint32_t dirty_n = 0;
     const std::uint8_t* hit_body[kMaxHits] = {};
     std::uint16_t hit_len[kMaxHits] = {};
-    std::uint64_t hit_rx[kMaxHits] = {};
-    std::uint16_t hit_before[kMaxHits] = {};
-    std::uint8_t hit_paced[kMaxHits] = {};
-    std::uint8_t hit_measured[kMaxHits] = {};
     std::uint32_t hit_n = 0;
 
     std::uint32_t bucket_add[kMaxHits] = {};
@@ -224,6 +220,13 @@ struct Shard {
     std::uint32_t zero[kMaxHits] = {};
 
     bool group = true;
+    std::uint16_t hit_pkt[kMaxHits] = {};
+    std::uint64_t pkt_rx[512] = {};
+    std::uint8_t pkt_paced[512] = {};
+    std::uint8_t pkt_measured[512] = {};
+    std::uint16_t pkt_before[512] = {};
+    std::uint16_t pkt_n = 0;
+    book::OrderTable::Order add_o[kMaxHits] = {};
     bool split_ab = false;
     bool collect = true;
     std::uint64_t polls_done = 0;
@@ -626,6 +629,19 @@ void settle_dirty(Shard* self, bool trading) {
     self->dirty_n = 0;
 }
 
+struct Carried {
+    std::uint64_t rx;
+    std::uint8_t paced;
+    std::uint8_t measured;
+    std::uint16_t before;
+};
+
+[[nodiscard]] inline Carried carried_of(const Shard* self, std::uint32_t i) {
+    const std::uint16_t k = self->hit_pkt[i];
+    return {self->pkt_rx[k], self->pkt_paced[k], self->pkt_measured[k],
+            self->pkt_before[k]};
+}
+
 void note_applied(Shard* self, std::uint16_t touched, std::uint64_t rx,
                   std::uint8_t paced, std::uint8_t measured, std::uint16_t before,
                   bool trading) {
@@ -658,25 +674,35 @@ void apply_stream(Shard* self, bool trading) {
         const itch::Message m{self->hit_body[i], self->hit_len[i]};
         std::uint16_t touched = 0;
         if (self->book.apply(m, &touched)) {
-            note_applied(self, touched, self->hit_rx[i], self->hit_paced[i],
-                         self->hit_measured[i], self->hit_before[i], trading);
+            const Carried c = carried_of(self, i);
+            note_applied(self, touched, c.rx, c.paced, c.measured, c.before, trading);
         }
     }
 }
 
 void apply_grouped(Shard* self, bool trading) {
-    for (std::uint32_t k = 0; k < self->add_n; ++k) {
-        const std::uint32_t i = self->bucket_add[k];
-        const std::uint8_t* b = self->hit_body[i];
-        const std::uint16_t sym = itch::read_be<std::uint16_t>(b + itch::kLocateOff);
-        const book::OrderTable::Order o{
-            itch::read_be<std::uint32_t>(b + itch::kAddSharesOff),
-            itch::read_be<std::uint32_t>(b + itch::kAddPriceOff),
-            static_cast<std::uint8_t>(b[itch::kAddSideOff] == 'B' ? 0 : 1), sym};
-        self->book.insert_at(itch::read_be<std::uint64_t>(b + itch::kAddRefOff), o);
-        self->book.level_move(sym, o.side, o.price, static_cast<std::int64_t>(o.shares));
-        note_applied(self, sym, self->hit_rx[i], self->hit_paced[i],
-                     self->hit_measured[i], self->hit_before[i], trading);
+    {
+        for (std::uint32_t k = 0; k < self->add_n; ++k) {
+            const std::uint8_t* b = self->hit_body[self->bucket_add[k]];
+            self->add_o[k] = book::OrderTable::Order{
+                itch::read_be<std::uint32_t>(b + itch::kAddSharesOff),
+                itch::read_be<std::uint32_t>(b + itch::kAddPriceOff),
+                static_cast<std::uint8_t>(b[itch::kAddSideOff] == 'B' ? 0 : 1),
+                itch::read_be<std::uint16_t>(b + itch::kLocateOff)};
+            self->book.insert_at(itch::read_be<std::uint64_t>(b + itch::kAddRefOff),
+                                 self->add_o[k]);
+        }
+        for (std::uint32_t k = 0; k < self->add_n; ++k) {
+            const book::OrderTable::Order& o = self->add_o[k];
+            self->book.level_move(o.sym, o.side, o.price,
+                                  static_cast<std::int64_t>(o.shares));
+        }
+        for (std::uint32_t k = 0; k < self->add_n; ++k) {
+            const std::uint32_t i = self->bucket_add[k];
+            const Carried c = carried_of(self, i);
+            note_applied(self, self->add_o[k].sym, c.rx, c.paced, c.measured, c.before,
+                         trading);
+        }
     }
     for (std::uint32_t k = 0; k < self->repl_n; ++k) {
         const std::uint8_t* b = self->hit_body[self->bucket_repl[k]];
@@ -706,10 +732,8 @@ void apply_grouped(Shard* self, bool trading) {
             const book::OrderTable::Order fresh = self->book.at(self->repl_new[k]);
             self->book.level_move(fresh.sym, fresh.side, fresh.price,
                                   static_cast<std::int64_t>(fresh.shares));
-            note_applied(self, fresh.sym, self->hit_rx[self->bucket_repl[k]],
-                         self->hit_paced[self->bucket_repl[k]],
-                         self->hit_measured[self->bucket_repl[k]],
-                         self->hit_before[self->bucket_repl[k]], trading);
+            const Carried c = carried_of(self, self->bucket_repl[k]);
+            note_applied(self, fresh.sym, c.rx, c.paced, c.measured, c.before, trading);
         }
     } else {
         for (std::uint32_t k = 0; k < self->repl_n; ++k) {
@@ -728,10 +752,8 @@ void apply_grouped(Shard* self, bool trading) {
             const book::OrderTable::Order fresh = self->book.at(self->repl_new[k]);
             self->book.level_move(fresh.sym, fresh.side, fresh.price,
                                   static_cast<std::int64_t>(fresh.shares));
-            note_applied(self, fresh.sym, self->hit_rx[self->bucket_repl[k]],
-                         self->hit_paced[self->bucket_repl[k]],
-                         self->hit_measured[self->bucket_repl[k]],
-                         self->hit_before[self->bucket_repl[k]], trading);
+            const Carried c = carried_of(self, self->bucket_repl[k]);
+            note_applied(self, fresh.sym, c.rx, c.paced, c.measured, c.before, trading);
         }
     }
     {
@@ -750,8 +772,8 @@ void apply_grouped(Shard* self, bool trading) {
             self->book.level_move(o.sym, o.side, o.price, -static_cast<std::int64_t>(o.shares));
             self->book.erase_at(self->keep_slot[j]);
             const std::uint32_t i = self->kwant[j];
-            note_applied(self, o.sym, self->hit_rx[i], self->hit_paced[i],
-                         self->hit_measured[i], self->hit_before[i], trading);
+            const Carried c = carried_of(self, i);
+            note_applied(self, o.sym, c.rx, c.paced, c.measured, c.before, trading);
         }
     }
     {
@@ -775,8 +797,8 @@ void apply_grouped(Shard* self, bool trading) {
             self->book.set_shares_at(self->keep_slot[j], o.shares - off);
             self->book.level_move(o.sym, o.side, o.price, -static_cast<std::int64_t>(off));
             const std::uint32_t i = self->zero[j];
-            note_applied(self, o.sym, self->hit_rx[i], self->hit_paced[i],
-                         self->hit_measured[i], self->hit_before[i], trading);
+            const Carried c = carried_of(self, i);
+            note_applied(self, o.sym, c.rx, c.paced, c.measured, c.before, trading);
             self->look[z] = self->keep_slot[j];
             z += o.shares == off ? 1u : 0u;
         }
@@ -789,6 +811,7 @@ void apply_hits(Shard* self, bool trading) {
     if (self->group) apply_grouped(self, trading);
     else apply_stream(self, trading);
     self->hit_n = 0;
+    self->pkt_n = 0;
 }
 
 void take_packet(Shard* self, const std::uint8_t* buf, std::uint32_t len,
@@ -819,41 +842,63 @@ void take_packet(Shard* self, const std::uint8_t* buf, std::uint32_t len,
         self->expect_seq = seq + count;
 
         const std::size_t payload = len - eth::kHeaderBytes - mold::kHeaderLen;
+        win::Phase pkt_where = win::Phase::kGap;
+        bool pkt_paced = false;
+        bool pkt_measured = false;
+        std::uint16_t pkt_before = 0;
+        if (payload >= itch::kLenPrefix + itch::kHeaderLen) {
+            const itch::Message head{p + mold::kHeaderLen + itch::kLenPrefix,
+                                     static_cast<std::uint16_t>(payload - itch::kLenPrefix)};
+            const std::uint64_t ts = head.timestamp();
+            win::note_session(head, &self->phase);
+            pkt_where = self->phase.advance(ts);
+            if (self->every_unit) {
+                const std::uint64_t u = self->phase.index();
+                if (u != self->at_window) {
+                    ++self->windows;
+                    self->at_window = u;
+                    self->window_ok = true;
+                }
+            }
+            if (pkt_where != self->was) {
+                if (pkt_where == win::Phase::kSettle) {
+                    self->caught_up = false;
+                    self->drain_mark = drained->load(std::memory_order_relaxed);
+                } else if (pkt_where == win::Phase::kWindow) {
+                    ++self->windows;
+                    self->at_window = self->windows;
+                    self->window_ok =
+                        self->caught_up &&
+                        drained->load(std::memory_order_relaxed) != self->drain_mark;
+                    if (!self->window_ok) ++self->windows_dropped;
+                    if (self->windows <= self->skip) self->window_ok = false;
+                    if (self->keep != 0 && self->windows > self->skip + self->keep) {
+                        self->window_ok = false;
+                    }
+                }
+                self->was = pkt_where;
+            }
+            pkt_paced = win::Tracker::one_to_one(pkt_where);
+            pkt_measured = pkt_where == win::Phase::kWindow && self->window_ok;
+            pkt_before = pkt_where == win::Phase::kSettle
+                             ? static_cast<std::uint16_t>(
+                                   (self->phase.open() - ts) / 10000000 + 1)
+                             : 0;
+            if (self->pkt_n < 512) {
+                self->pkt_rx[self->pkt_n] = hw_ts;
+                self->pkt_paced[self->pkt_n] = pkt_paced ? 1 : 0;
+                self->pkt_measured[self->pkt_n] = pkt_measured ? 1 : 0;
+                self->pkt_before[self->pkt_n] = pkt_before;
+            }
+        }
         (void)itch::for_each_message(
             p + mold::kHeaderLen, payload, [&](const itch::Message& m) {
                 ++self->messages;
                 if (self->poll_msgs == 0) self->poll_when = m.timestamp();
                 ++self->poll_msgs;
-                win::note_session(m, &self->phase);
-                const win::Phase where = self->phase.advance(m.timestamp());
-                if (self->every_unit) {
-                    const std::uint64_t u = self->phase.index();
-                    if (u != self->at_window) {
-                        ++self->windows;
-                        self->at_window = u;
-                        self->window_ok = true;
-                    }
-                }
-                if (where != self->was) {
-                    if (where == win::Phase::kSettle) {
-                        self->caught_up = false;
-                        self->drain_mark = drained->load(std::memory_order_relaxed);
-                    } else if (where == win::Phase::kWindow) {
-                        ++self->windows;
-                        self->at_window = self->windows;
-                        self->window_ok =
-                            self->caught_up &&
-                            drained->load(std::memory_order_relaxed) != self->drain_mark;
-                        if (!self->window_ok) ++self->windows_dropped;
-                        if (self->windows <= self->skip) self->window_ok = false;
-                        if (self->keep != 0 && self->windows > self->skip + self->keep) {
-                            self->window_ok = false;
-                        }
-                    }
-                    self->was = where;
-                }
-                const bool paced = win::Tracker::one_to_one(where);
-                const bool measured = where == win::Phase::kWindow && self->window_ok;
+                const win::Phase where = pkt_where;
+                const bool paced = pkt_paced;
+                const bool measured = pkt_measured;
                 if (where == win::Phase::kWindow) {
                     ++self->window_messages;
                     if (!self->window_ok) ++self->dropped_samples;
@@ -879,11 +924,7 @@ void take_packet(Shard* self, const std::uint8_t* buf, std::uint32_t len,
                     return true;
                 }
                 if (!mine(sym)) return true;
-                const std::uint16_t before =
-                    where == win::Phase::kSettle
-                        ? static_cast<std::uint16_t>(
-                              (self->phase.open() - m.timestamp()) / 10000000 + 1)
-                        : 0;
+                const std::uint16_t before = pkt_before;
                 if (!self->collect) {
                     std::uint16_t touched = 0;
                     if (self->book.apply(m, &touched)) {
@@ -904,13 +945,11 @@ void take_packet(Shard* self, const std::uint8_t* buf, std::uint32_t len,
                 }
                 self->hit_body[self->hit_n] = m.body;
                 self->hit_len[self->hit_n] = m.len;
-                self->hit_rx[self->hit_n] = hw_ts;
-                self->hit_paced[self->hit_n] = paced ? 1 : 0;
-                self->hit_measured[self->hit_n] = measured ? 1 : 0;
-                self->hit_before[self->hit_n] = before;
+                self->hit_pkt[self->hit_n] = self->pkt_n;
                 ++self->hit_n;
                 return true;
             });
+        if (self->pkt_n < 512) ++self->pkt_n;
     }
 }
 

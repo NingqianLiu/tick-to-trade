@@ -145,15 +145,11 @@ public:
         const std::uint16_t ip_total =
             static_cast<std::uint16_t>(kIpLen + kTcpLen + body_len);
         put16(frame + kIpTotalLenOff, ip_total);
-        put16(frame + kIpSumOff, fold(ip_base_ + ip_total));
+        put16(frame + kIpSumOff, 0);
         put32(frame + kTcpSeqOff, seq);
         put32(frame + kTcpAckOff, ack);
         frame[kTcpFlagsOff] = flags;
-        const std::uint32_t tcp_len = static_cast<std::uint32_t>(kTcpLen + body_len);
-        std::uint32_t s = tcp_base_ + tcp_len + (seq >> 16) + (seq & 0xffff) +
-                          (ack >> 16) + (ack & 0xffff) + flags;
-        if (body_len != 0 && body != nullptr) s += sum16(body, body_len);
-        put16(frame + kTcpSumOff, fold(s));
+        put16(frame + kTcpSumOff, 0);
         return kHeaderLen + body_len;
     }
 

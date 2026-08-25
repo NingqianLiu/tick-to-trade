@@ -63,39 +63,26 @@ TEST(MinTcp, the_header_is_the_right_shape) {
     EXPECT_EQ(mintcp::get32(f.data() + mintcp::kTcpAckOff), 7u);
 }
 
-TEST(MinTcp, the_ip_checksum_checks_out) {
+TEST(MinTcp, build_leaves_both_checksums_for_the_card) {
     Conn c = opened();
-    std::vector<std::uint8_t> f(200, 0);
+    std::vector<std::uint8_t> f(400, 0xcc);
     for (std::size_t len : {std::size_t{0}, std::size_t{1}, std::size_t{50},
-                            std::size_t{100}}) {
+                            std::size_t{150}, std::size_t{301}}) {
         std::vector<std::uint8_t> body(len, 0xa5);
         (void)c.build(f.data(), body.data(), len, mintcp::kAck, 5, 6);
-        EXPECT_EQ(sum_of(f.data() + mintcp::kEthLen, mintcp::kIpLen), 0xffffu)
+        EXPECT_EQ(mintcp::get16(f.data() + mintcp::kIpSumOff), 0u)
+            << "body length " << len;
+        EXPECT_EQ(mintcp::get16(f.data() + mintcp::kTcpSumOff), 0u)
             << "body length " << len;
     }
 }
 
-TEST(MinTcp, the_tcp_checksum_checks_out) {
+TEST(MinTcp, the_handshake_frame_still_carries_a_real_ip_checksum) {
     Conn c = opened();
-    std::vector<std::uint8_t> f(400, 0);
-    for (std::size_t len : {std::size_t{0}, std::size_t{1}, std::size_t{50},
-                            std::size_t{150}, std::size_t{301}}) {
-        std::vector<std::uint8_t> body(len);
-        for (std::size_t i = 0; i < len; ++i) {
-            body[i] = static_cast<std::uint8_t>(i * 7 + 3);
-        }
-        (void)c.build(f.data(), body.data(), len, mintcp::kAck | mintcp::kPsh,
-                      0x11223344, 0x55667788);
-        const std::uint32_t tcp_len =
-            static_cast<std::uint32_t>(mintcp::kTcpLen + len);
-        std::uint32_t s = (eth::ipv4(10, 9, 9, 2) >> 16) +
-                          (eth::ipv4(10, 9, 9, 2) & 0xffff) +
-                          (eth::ipv4(10, 9, 9, 1) >> 16) +
-                          (eth::ipv4(10, 9, 9, 1) & 0xffff) + 6u + tcp_len;
-        s += mintcp::sum16(f.data() + mintcp::kEthLen + mintcp::kIpLen, tcp_len);
-        while (s >> 16) s = (s & 0xffff) + (s >> 16);
-        EXPECT_EQ(s, 0xffffu) << "body length " << len;
-    }
+    std::vector<std::uint8_t> f(200, 0);
+    const std::size_t n = c.send_syn(f.data(), 7);
+    EXPECT_GT(n, mintcp::kHeaderLen);
+    EXPECT_EQ(sum_of(f.data() + mintcp::kEthLen, mintcp::kIpLen), 0xffffu);
 }
 
 TEST(MinTcp, sending_advances_the_stream_by_what_went) {
