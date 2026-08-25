@@ -24,6 +24,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "book/imbalance.hpp"
@@ -47,6 +48,7 @@ namespace {
 struct Options {
     const char* intf = "enp129s0f1";
     const char* reference = "results/prev_close_061226.csv";
+    const char* symbols = nullptr;
     std::uint32_t dst_ip = eth::ipv4(239, 9, 9, 1);
     std::uint16_t dst_port = 26477;
     std::uint16_t dst_port_b = 0;
@@ -113,6 +115,8 @@ struct Shard {
     std::size_t at_window = 0;
     std::vector<std::uint16_t> raw_window;
     std::vector<std::uint8_t> symbols;
+    std::vector<std::uint8_t> traded;
+    std::uint64_t bound = 0, unbound = 0;
 };
 
 bool read_reference(const char* path, std::unordered_map<std::string, std::uint32_t>* out,
@@ -300,10 +304,13 @@ void reap(Shard* self) {
 void take_packet(Shard* self, const std::uint8_t* buf, std::uint32_t len,
                  std::uint64_t hw_ts, unsigned id, unsigned shards,
                  const std::unordered_map<std::string, std::uint32_t>* reference,
+                 const std::unordered_set<std::string>* wanted,
                  bool trading, const std::atomic<std::uint64_t>* drained) {
     const bool by_mask = (shards & (shards - 1)) == 0;
     const unsigned mask = shards - 1;
+    const std::uint8_t* traded = self->traded.empty() ? nullptr : self->traded.data();
     const auto mine = [=](std::uint16_t sym) {
+        if (traded != nullptr && traded[sym] == 0) return false;
         return by_mask ? (sym & mask) == id : sym % shards == id;
     };
     {
@@ -354,14 +361,23 @@ void take_packet(Shard* self, const std::uint8_t* buf, std::uint32_t len,
                     if (!self->window_ok) ++self->dropped_samples;
                 }
                 const std::uint16_t sym = m.stock_locate();
-                if (m.type() == 'R' && mine(sym)) {
+                if (m.type() == 'R') {
                     const char* s2 =
                         reinterpret_cast<const char*>(m.body + itch::kStockSymbolOff);
-                    std::memcpy(&self->symbols[sym * 8], s2, itch::kStockSymbolLen);
                     std::size_t n = itch::kStockSymbolLen;
                     while (n > 0 && s2[n - 1] == ' ') --n;
+                    if (!self->traded.empty()) {
+                        self->traded[sym] =
+                            wanted->count(std::string(s2, n)) != 0 ? 1 : 0;
+                    }
+                    if (!mine(sym)) return true;
+                    std::memcpy(&self->symbols[sym * 8], s2, itch::kStockSymbolLen);
                     const auto it = reference->find(std::string(s2, n));
-                    if (it != reference->end()) self->book.bind(sym, it->second);
+                    if (it != reference->end() && self->book.bind(sym, it->second)) {
+                        ++self->bound;
+                    } else {
+                        ++self->unbound;
+                    }
                     return true;
                 }
                 if (!mine(sym)) return true;
@@ -402,6 +418,7 @@ void take_packet(Shard* self, const std::uint8_t* buf, std::uint32_t len,
 void run_shard(Shard* self, unsigned id, unsigned shards, const ring::Ring* r,
                const std::atomic<bool>* done, int cpu,
                const std::unordered_map<std::string, std::uint32_t>* reference,
+               const std::unordered_set<std::string>* wanted,
                bool trading, const std::atomic<std::uint64_t>* drained) {
     pin(cpu);
     if (trading) arm(self);
@@ -424,7 +441,8 @@ void run_shard(Shard* self, unsigned id, unsigned shards, const ring::Ring* r,
             continue;
         }
         ++self->cursor.want;
-        take_packet(self, v.buf, v.len, v.hw_ts, id, shards, reference, trading, drained);
+        take_packet(self, v.buf, v.len, v.hw_ts, id, shards, reference, wanted, trading,
+                    drained);
     }
 }
 
@@ -437,6 +455,7 @@ int main(int argc, char** argv) {
         const char* a = argv[i];
         if (std::strcmp(a, "--intf") == 0 && has) opt.intf = argv[++i];
         else if (std::strcmp(a, "--reference") == 0 && has) opt.reference = argv[++i];
+        else if (std::strcmp(a, "--symbols") == 0 && has) opt.symbols = argv[++i];
         else if (std::strcmp(a, "--dst-ip") == 0 && has) {
             if (!parse_ip(argv[++i], &opt.dst_ip)) return 2;
         } else if (std::strcmp(a, "--dst-port") == 0 && has) {
@@ -463,7 +482,8 @@ int main(int argc, char** argv) {
             opt.lock_memory = true;
         } else {
             std::fprintf(stderr,
-                         "usage: trader [--intf I] [--reference CSV] [--dst-ip A.B.C.D]\n"
+                         "usage: trader [--intf I] [--reference CSV] [--symbols FILE]\n"
+                     "              [--dst-ip A.B.C.D]\n"
                          "              [--dst-port N] [--dst-port-b N] [--shards N]\n"
                          "              [--cpu-base N] [--threshold N] [--idle-ms N]\n"
                          "              [--order-ip A.B.C.D] [--order-port N] [--out DIR]\n"
@@ -479,6 +499,36 @@ int main(int argc, char** argv) {
     if (!read_reference(opt.reference, &reference, &prices)) {
         std::fprintf(stderr, "cannot read %s\n", opt.reference);
         return 1;
+    }
+
+    std::unordered_set<std::string> wanted;
+    if (opt.symbols != nullptr) {
+        std::FILE* f = std::fopen(opt.symbols, "r");
+        if (f == nullptr) {
+            std::fprintf(stderr, "cannot read %s\n", opt.symbols);
+            return 1;
+        }
+        char line[64];
+        while (std::fgets(line, sizeof(line), f) != nullptr) {
+            std::string s(line);
+            while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) {
+                s.pop_back();
+            }
+            if (!s.empty()) wanted.insert(s);
+        }
+        std::fclose(f);
+        if (wanted.empty()) {
+            std::fprintf(stderr, "%s named no securities\n", opt.symbols);
+            return 1;
+        }
+        std::vector<std::uint32_t> keep;
+        for (const auto& n : wanted) {
+            const auto it = reference.find(n);
+            if (it != reference.end()) keep.push_back(it->second);
+        }
+        std::printf("universe       %zu names, %zu of them with a reference price\n",
+                    wanted.size(), keep.size());
+        prices.swap(keep);
     }
 
     pin(opt.cpu_base);
@@ -515,8 +565,10 @@ int main(int argc, char** argv) {
     ef_vi_receive_push(vi.get());
 
     const std::size_t orders_each = 12u << 20;
+    const std::size_t whole = book::PriceLevels::budget_for(prices);
     const std::size_t words_each =
-        book::PriceLevels::budget_for(prices) / opt.shards * 3 / 2 + (1u << 20);
+        opt.symbols != nullptr ? whole + (1u << 20)
+                               : whole / opt.shards * 3 / 2 + (1u << 20);
     std::printf("%u shards, %.2f GB of prices and %zu orders each\n", opt.shards,
                 words_each * 8.0 / 1e9, orders_each);
 
@@ -550,8 +602,9 @@ int main(int argc, char** argv) {
         shards.back()->raw.reserve(sample_cap);
         shards.back()->raw_window.assign(sample_cap, 0);
         shards.back()->raw_window.clear();
-        shards.back()->settle_at.reserve(4u << 20);
-        shards.back()->settle_ns.reserve(4u << 20);
+        shards.back()->settle_at.reserve(sample_cap);
+        shards.back()->settle_ns.reserve(sample_cap);
+        if (!wanted.empty()) shards.back()->traded.assign(65536, 0);
         shards.back()->profile = opt.profile;
     }
     if (skip != 0 || keep != 0) {
@@ -573,7 +626,7 @@ int main(int argc, char** argv) {
     for (unsigned i = 0; !single && i < opt.shards; ++i) {
         threads.emplace_back(run_shard, shards[i].get(), i, opt.shards, &r, &done,
                              opt.cpu_base < 0 ? -1 : opt.cpu_base + 1 + static_cast<int>(i),
-                             &reference, trading, &drained);
+                             &reference, &wanted, trading, &drained);
     }
 
     nic::Drops before;
@@ -625,7 +678,7 @@ int main(int argc, char** argv) {
             if (single) {
                 take_packet(shards[0].get(), buf + prefix,
                             static_cast<std::uint32_t>(len), at, 0, 1, &reference,
-                            trading, &drained);
+                            &wanted, trading, &drained);
             } else {
                 r.publish(buf + prefix, static_cast<std::uint32_t>(len), at, ts.tv_flags);
             }
@@ -645,7 +698,7 @@ int main(int argc, char** argv) {
 
     std::uint64_t messages = 0, applied = 0, buys = 0, sells = 0;
     std::uint64_t gaps = 0, duplicates = 0, lapped = 0, orphan = 0, live = 0;
-    std::uint64_t full = 0;
+    std::uint64_t full = 0, bound = 0, unbound = 0;
     std::uint64_t sent = 0, refused = 0, stamped = 0, no_slot = 0;
     std::uint64_t why[8] = {};
     std::uint64_t warmed = 0;
@@ -675,6 +728,8 @@ int main(int argc, char** argv) {
         lapped += s->lapped;
         orphan += s->book.counters().orphan;
         full += s->book.counters().full;
+        bound += s->bound;
+        unbound += s->unbound;
         live += s->book.live();
     }
 
@@ -682,6 +737,8 @@ int main(int argc, char** argv) {
     std::printf("messages       %" PRIu64 " (each shard saw all of them)\n", messages);
     std::printf("applied        %" PRIu64 " across the shards\n", applied);
     std::printf("orders alive   %" PRIu64 "\n", live);
+    std::printf("bound          %" PRIu64 " securities, %" PRIu64 " without a price space\n",
+                bound, unbound);
     std::printf("rate           %.3f s, %.2f M messages/s\n", wall,
                 wall > 0 ? messages / wall / 1e6 : 0.0);
     std::printf("signals        %" PRIu64 " (buy %" PRIu64 ", sell %" PRIu64 ")"
