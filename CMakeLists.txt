@@ -13,7 +13,7 @@ add_compile_options(-O3 -march=${ITCH_ARCH} -Wall -Wextra)
 add_library(itch INTERFACE)
 target_include_directories(itch INTERFACE ${CMAKE_SOURCE_DIR}/src)
 
-foreach(tool itch_scan book_ref make_packets make_prev_close book_check frame_check)
+foreach(tool itch_scan book_ref make_packets make_prev_close book_check frame_check apply_bench)
   add_executable(${tool} src/tools/${tool}.cpp)
   target_link_libraries(${tool} PRIVATE itch)
 endforeach()

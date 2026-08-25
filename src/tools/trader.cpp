@@ -5,6 +5,7 @@
 #include <sched.h>
 #include <malloc.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -60,10 +61,14 @@ struct Options {
     const char* order_ip = nullptr;
     std::uint16_t order_port = 45100;
     const char* order_local = "10.9.9.2";
-    bool own_tcp = false;
+    const char* stat = nullptr;
+    bool own_tcp = true;
     const char* out = nullptr;
     bool profile = false;
     bool batch_packets = false;
+    int gather = 1;
+    bool segments = false;
+    unsigned every = 0;
     bool coalesce = true;
     bool lock_memory = false;
 };
@@ -107,11 +112,16 @@ struct Shard {
         std::uint64_t poll = 0;
         std::uint64_t in = 0;
         std::uint64_t s1 = 0, s2 = 0, s3 = 0, out = 0;
+        std::uint64_t body = 0;
         std::uint16_t before = 0;
         std::uint16_t sym = 0;
         std::uint16_t polln = 0, polli = 0;
         bool counted = false;
     };
+    unsigned every = 0;
+    unsigned since = 0;
+    std::uint64_t paced_seen = 0;
+    std::uint64_t cur_body = 0;
     Order pend[kMaxPerFrame];
     std::size_t pend_n = 0;
     Order flight[kOrderSlots][kMaxPerFrame];
@@ -154,6 +164,25 @@ struct Shard {
     std::vector<std::uint64_t> raw_rx;
     std::vector<std::uint16_t> raw_polln, raw_polli;
     std::uint16_t poll_n = 0, poll_i = 0;
+    std::vector<std::uint64_t> stat_when;
+    std::vector<std::uint16_t> stat_pkts;
+    std::vector<std::uint16_t> stat_msgs;
+    std::vector<std::uint32_t> stat_span;
+    std::vector<std::uint32_t> stat_gap;
+    std::vector<std::uint32_t> stat_proc;
+    std::vector<std::uint32_t> stat_send;
+    std::vector<std::uint64_t> stat_raw_poll;
+    std::vector<std::uint64_t> stat_raw_body;
+    std::vector<std::uint64_t> stat_raw_done;
+    std::vector<std::uint64_t> stat_raw_nic;
+    std::vector<std::uint32_t> stat_blind;
+    std::size_t stat_used = 0;
+    std::uint32_t poll_msgs = 0;
+    std::uint64_t poll_when = 0;
+    std::uint64_t last_poll_seen = 0;
+    std::uint64_t last_empty = 0;
+    std::uint64_t empty_worst[3] = {};
+    std::uint64_t empty_over[3] = {};
     std::uint16_t at_polln[kOrderSlots] = {};
     std::uint16_t at_polli[kOrderSlots] = {};
     std::uint16_t at_sym[kOrderSlots] = {};
@@ -166,6 +195,7 @@ struct Shard {
     std::uint64_t at_s2[kOrderSlots] = {};
     std::uint64_t at_s3[kOrderSlots] = {};
     std::vector<std::uint64_t> raw_s1, raw_s2, raw_s3;
+    std::vector<std::uint64_t> raw_body;
     std::uint64_t poll_at = 0;
     std::uint64_t msgs_by_depth[65][33] = {};
     struct PollRec {
@@ -343,7 +373,7 @@ void flush_orders(Shard* self) {
 }
 
 void send_order(Shard* self, std::uint16_t sym, char side, std::uint64_t rx_ts,
-                bool keep, std::uint16_t before) {
+                bool keep, std::uint16_t before, std::uint32_t fixed = 0) {
     const std::uint64_t enter = tsc::now();
     if (!self->own_tcp && self->frames - self->reaped >= kOrderSlots) {
         reap(self);
@@ -388,7 +418,11 @@ void send_order(Shard* self, std::uint16_t sym, char side, std::uint64_t rx_ts,
     std::uint32_t price = 0, shares = 0;
     const std::uint8_t take_from =
         side == ouch::kBuy ? book::PriceLevels::kSell : book::PriceLevels::kBuy;
-    if (!self->book.best(sym, take_from, &price, &shares)) return;
+    if (fixed != 0) {
+        price = fixed;
+    } else if (!self->book.best(sym, take_from, &price, &shares)) {
+        return;
+    }
 
     std::uint8_t* slot = self->txbuf.at(self->next_slot);
     const std::uint64_t s0 = self->profile ? tsc::now() : 0;
@@ -402,6 +436,7 @@ void send_order(Shard* self, std::uint16_t sym, char side, std::uint64_t rx_ts,
     Shard::Order& o = self->pend[self->pend_n++];
     o.rx = rx_ts;
     o.poll = self->poll_at;
+    o.body = self->cur_body;
     o.in = enter;
     o.s1 = tsc::now();
     o.before = before;
@@ -410,6 +445,13 @@ void send_order(Shard* self, std::uint16_t sym, char side, std::uint64_t rx_ts,
     o.polli = self->poll_i;
     o.counted = keep;
     if (!self->coalesce || self->pend_n == kMaxPerFrame) flush_orders(self);
+}
+
+[[gnu::always_inline]] inline std::uint64_t fenced_now() noexcept {
+    __builtin_ia32_lfence();
+    const std::uint64_t t = tsc::now();
+    __builtin_ia32_lfence();
+    return t;
 }
 
 bool read_neighbour(std::uint32_t peer_ip, std::uint8_t out[6]) {
@@ -577,6 +619,7 @@ void reap(Shard* self) {
                     self->raw_out.push_back(o.out);
                     self->raw_s1.push_back(o.s1);
                     self->raw_s2.push_back(o.s2);
+                    self->raw_body.push_back(o.body);
                     self->raw_s3.push_back(o.s3);
                 }
                 if (self->at_window < self->per_window.size()) {
@@ -629,6 +672,8 @@ void take_packet(Shard* self, const std::uint8_t* buf, std::uint32_t len,
         (void)itch::for_each_message(
             p + mold::kHeaderLen, payload, [&](const itch::Message& m) {
                 ++self->messages;
+                if (self->poll_msgs == 0) self->poll_when = m.timestamp();
+                ++self->poll_msgs;
                 win::note_session(m, &self->phase);
                 const win::Phase where = self->phase.advance(m.timestamp());
                 if (self->every_unit) {
@@ -685,6 +730,25 @@ void take_packet(Shard* self, const std::uint8_t* buf, std::uint32_t len,
                 }
                 if (!mine(sym)) return true;
                 std::uint16_t touched = 0;
+                if (self->every != 0) {
+                    if (!paced) return true;
+                    ++self->paced_seen;
+                    if (++self->since < self->every) return true;
+                    self->since = 0;
+                    ++self->paced_orders;
+                    const std::uint16_t before2 =
+                        where == win::Phase::kSettle
+                            ? static_cast<std::uint16_t>(
+                                  (self->phase.open() - m.timestamp()) / 10000000 + 1)
+                            : 0;
+                    const char side2 =
+                        (self->user_ref & 1) ? ouch::kBuy : ouch::kSell;
+                    if (trading) {
+                        send_order(self, sym, side2, hw_ts, measured, before2,
+                                   1000000);
+                    }
+                    return true;
+                }
                 const std::uint64_t t0 = self->profile ? tsc::now() : 0;
                 if (!self->book.apply(m, &touched)) return true;
                 ++self->applied;
@@ -783,10 +847,23 @@ int main(int argc, char** argv) {
             opt.profile = true;
         } else if (std::strcmp(a, "--batch-packets") == 0) {
             opt.batch_packets = true;
+        } else if (std::strcmp(a, "--order-every") == 0 && i + 1 < argc) {
+            opt.every = static_cast<unsigned>(std::atoi(argv[++i]));
+        } else if (std::strcmp(a, "--segments") == 0) {
+            opt.segments = true;
+        } else if (std::strcmp(a, "--gather") == 0 && i + 1 < argc) {
+            const char* w = argv[++i];
+            opt.gather = std::strcmp(w, "prefetch") == 0 ? 1
+                         : std::strcmp(w, "copy") == 0   ? 2
+                                                         : 0;
         } else if (std::strcmp(a, "--one-order-per-message") == 0) {
             opt.coalesce = false;
         } else if (std::strcmp(a, "--own-tcp") == 0) {
             opt.own_tcp = true;
+        } else if (std::strcmp(a, "--stat") == 0 && has) {
+            opt.stat = argv[++i];
+        } else if (std::strcmp(a, "--onload-send") == 0) {
+            opt.own_tcp = false;
         } else if (std::strcmp(a, "--local-ip") == 0 && has) {
             opt.order_local = argv[++i];
         } else if (std::strcmp(a, "--lock-memory") == 0) {
@@ -799,7 +876,7 @@ int main(int argc, char** argv) {
                          "              [--cpu-base N] [--threshold N] [--idle-ms N]\n"
                          "              [--order-ip A.B.C.D] [--order-port N] [--out DIR]\n"
                          "              [--batch-packets] [--one-order-per-message]\n"
-                         "              [--own-tcp] [--local-ip A.B.C.D]\n"
+                         "              [--onload-send] [--local-ip A.B.C.D]\n"
                          "  ITCH_SKIP_WINDOWS / ITCH_MAX_WINDOWS pick which windows count\n"
                          "  sending orders needs onload in front of it\n");
             return 2;
@@ -870,6 +947,8 @@ int main(int argc, char** argv) {
         }
     }
 
+    std::printf("order path     %s\n",
+                opt.own_tcp ? "our own TCP" : "Onload delegated send");
     std::uint32_t peer_ip = 0, local_ip = 0;
     if (opt.own_tcp && opt.shards != 1) {
         std::fprintf(stderr, "own tcp runs with one shard\n");
@@ -961,6 +1040,8 @@ int main(int argc, char** argv) {
         shards.back()->raw_s1.clear();
         shards.back()->raw_s2.assign(sample_cap, 0);
         shards.back()->raw_s2.clear();
+        shards.back()->raw_body.assign(sample_cap, 0);
+        shards.back()->raw_body.clear();
         shards.back()->raw_s3.assign(sample_cap, 0);
         shards.back()->raw_s3.clear();
         shards.back()->poll_room = 10000000;
@@ -971,7 +1052,26 @@ int main(int argc, char** argv) {
         shards.back()->profile = opt.profile;
         shards.back()->coalesce = opt.coalesce;
         shards.back()->own_tcp = opt.own_tcp;
+        shards.back()->every = opt.every;
         shards.back()->every_unit = wp.mask == 0;
+    }
+
+    if (opt.stat != nullptr && !shards.empty()) {
+        constexpr std::size_t kStatCap = 80u << 20;
+        shards[0]->stat_when.assign(kStatCap, 0);
+        shards[0]->stat_pkts.assign(kStatCap, 0);
+        shards[0]->stat_msgs.assign(kStatCap, 0);
+        shards[0]->stat_span.assign(kStatCap, 0);
+        shards[0]->stat_gap.assign(kStatCap, 0);
+        shards[0]->stat_proc.assign(kStatCap, 0);
+        shards[0]->stat_send.assign(kStatCap, 0);
+        shards[0]->stat_raw_poll.assign(kStatCap, 0);
+        shards[0]->stat_raw_body.assign(kStatCap, 0);
+        shards[0]->stat_raw_done.assign(kStatCap, 0);
+        shards[0]->stat_raw_nic.assign(kStatCap, 0);
+        shards[0]->stat_blind.assign(kStatCap, 0);
+        std::printf("stat           room for %zu polls, %.1f GB, pre-touched\n",
+                    kStatCap, kStatCap * 12.0 / (1u << 30));
     }
     if (skip != 0 || keep != 0) {
         std::printf("counting windows %llu..%s\n",
@@ -1001,7 +1101,20 @@ int main(int argc, char** argv) {
         }
     }
     const bool single = opt.shards == 1;
-    const bool batch_packets = opt.batch_packets;
+    constexpr int kGatherNone = 0, kGatherPrefetch = 1, kGatherCopy = 2;
+    const int gather = opt.gather;
+    (void)kGatherNone;
+    std::printf("gather         %s\n",
+                gather == kGatherPrefetch ? "prefetch the batch"
+                : gather == kGatherCopy   ? "copy the batch"
+                                          : "none, touch each packet in turn");
+    std::vector<std::uint8_t> copymem(64 * cfg::kRxSlotBytes, 0);
+    std::uint8_t* const copybuf = copymem.data();
+    const bool stat_on = opt.stat != nullptr;
+    const bool timing = stat_on || opt.segments;
+    std::printf("segments       %s\n",
+                timing ? "on, four segments timed per poll"
+                       : "off, no per-poll clock reads");
     const bool own_tcp = opt.own_tcp;
     const std::uint64_t rto_ticks =
         static_cast<std::uint64_t>(1e6 * tsc::ticks_per_ns());
@@ -1025,12 +1138,28 @@ int main(int argc, char** argv) {
     for (;;) {
         const int n = ef_eventq_poll(vi.get(), evs, 64);
         if (n == 0) {
+            if (stat_on && single) shards[0]->last_empty = tsc::now();
+            const std::uint64_t e0 = stat_on ? tsc::now() : 0;
             drained.fetch_add(1, std::memory_order_relaxed);
+            const std::uint64_t e1 = stat_on ? tsc::now() : 0;
             if (single) {
                 shards[0]->caught_up = true;
                 if (trading) {
                     reap(shards[0].get());
+                    const std::uint64_t e2 = stat_on ? tsc::now() : 0;
                     resend_stale(shards[0].get(), rto_ticks);
+                    if (stat_on) {
+                        const std::uint64_t e3 = tsc::now();
+                        Shard* sh = shards[0].get();
+                        const std::uint64_t d[3] = {
+                            static_cast<std::uint64_t>((e1 - e0) / tps),
+                            static_cast<std::uint64_t>((e2 - e1) / tps),
+                            static_cast<std::uint64_t>((e3 - e2) / tps)};
+                        for (int q = 0; q < 3; ++q) {
+                            if (d[q] > sh->empty_worst[q]) sh->empty_worst[q] = d[q];
+                            if (d[q] >= 10000) ++sh->empty_over[q];
+                        }
+                    }
                 }
             }
             if (packets != 0 && tsc::now() - last_seen > idle_ticks) break;
@@ -1044,22 +1173,38 @@ int main(int argc, char** argv) {
         }
         last_seen = tsc::now();
         ++shards[0]->depth[n < 65 ? n : 64];
-        if (batch_packets) {
+        const std::uint64_t g1 = timing ? fenced_now() : 0;
+        if (gather == kGatherPrefetch) {
             for (int i = 0; i < n; ++i) {
                 if (EF_EVENT_TYPE(evs[i]) != EF_EVENT_TYPE_RX) continue;
                 const std::uint8_t* b = frames.at(EF_EVENT_RX_RQ_ID(evs[i]));
                 __builtin_prefetch(b, 0, 3);
                 __builtin_prefetch(b + 64, 0, 3);
             }
+        } else if (gather == kGatherCopy) {
+            for (int i = 0; i < n; ++i) {
+                if (EF_EVENT_TYPE(evs[i]) != EF_EVENT_TYPE_RX) continue;
+                const std::size_t all = EF_EVENT_RX_BYTES(evs[i]);
+                std::memcpy(copybuf + static_cast<std::size_t>(i) * cfg::kRxSlotBytes,
+                            frames.at(EF_EVENT_RX_RQ_ID(evs[i])),
+                            all < cfg::kRxSlotBytes ? all : cfg::kRxSlotBytes);
+            }
         }
+        const std::uint64_t g2 = timing ? fenced_now() : 0;
+        if (single) shards[0]->cur_body = g2;
+        if (single) { shards[0]->poll_msgs = 0; shards[0]->poll_when = 0; }
         const std::uint64_t sent_before = single ? shards[0]->sent : 0;
         ++poll_seq;
         const bool in_window = single && shards[0]->was == win::Phase::kWindow;
-        const std::uint64_t poll_tsc_always = in_window ? tsc::now() : 0;
+        const std::uint64_t poll_tsc_always = in_window ? g1 : 0;
+        const std::uint64_t stat_poll_tsc =
+            (stat_on && poll_tsc_always == 0) ? tsc::now() : poll_tsc_always;
+        std::uint64_t first_body = 0;
         const bool keep_poll = in_window && (n >= 2 || (poll_seq & 1023) == 0) &&
                                shards[0]->poll_rows < shards[0]->poll_room;
         const std::uint64_t poll_tsc = poll_tsc_always;
         std::uint64_t first_rx = 0;
+        std::uint64_t last_rx = 0;
         for (int i = 0; i < n; ++i) {
             if (single) {
                 shards[0]->poll_n = static_cast<std::uint16_t>(n);
@@ -1075,7 +1220,10 @@ int main(int argc, char** argv) {
             }
             const std::size_t slot = EF_EVENT_RX_RQ_ID(evs[i]);
             const std::size_t len = EF_EVENT_RX_BYTES(evs[i]) - prefix;
-            std::uint8_t* buf = frames.at(slot);
+            std::uint8_t* buf =
+                gather == kGatherCopy
+                    ? copybuf + static_cast<std::size_t>(i) * cfg::kRxSlotBytes
+                    : frames.at(slot);
             if (own_tcp && len > eth::kEthernetBytes + 9 &&
                 buf[prefix + eth::kEthernetBytes + 9] == IPPROTO_TCP) {
                 take_ack(shards[0].get(), buf + prefix, len);
@@ -1092,6 +1240,12 @@ int main(int argc, char** argv) {
             const std::uint64_t at =
                 static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ull + ts.tv_nsec;
             if (first_rx == 0) first_rx = at;
+            last_rx = at;
+            if (stat_on && first_body == 0) {
+                volatile const std::uint8_t* probe = buf + prefix;
+                (void)*probe;
+                first_body = tsc::now();
+            }
             if (single) {
                 take_packet(shards[0].get(), buf + prefix,
                             static_cast<std::uint32_t>(len), at, 0, 1, &reference,
@@ -1103,7 +1257,9 @@ int main(int argc, char** argv) {
             ++next_post;
             if (ef_vi_receive_init(vi.get(), frames.dma(give), give) < 0) ++discards;
         }
+        const std::uint64_t done_tsc = single ? tsc::now() : 0;
         if (single && trading) flush_orders(shards[0].get());
+        const std::uint64_t sent_tsc = single ? tsc::now() : 0;
         if (keep_poll && first_rx != 0) {
             Shard::PollRec& rec = shards[0]->polls[shards[0]->poll_rows++];
             rec.at = poll_tsc;
@@ -1111,6 +1267,41 @@ int main(int argc, char** argv) {
             rec.events = static_cast<std::uint32_t>(n);
             rec.orders = static_cast<std::uint32_t>(shards[0]->sent - sent_before);
         }
+        if (single && shards[0]->stat_used < shards[0]->stat_when.size()) {
+            const std::size_t k = shards[0]->stat_used++;
+            shards[0]->stat_when[k] = shards[0]->poll_when;
+            shards[0]->stat_pkts[k] = static_cast<std::uint16_t>(n);
+            shards[0]->stat_msgs[k] = static_cast<std::uint16_t>(
+                shards[0]->poll_msgs > 65535 ? 65535 : shards[0]->poll_msgs);
+            const std::uint64_t span = last_rx > first_rx ? last_rx - first_rx : 0;
+            shards[0]->stat_span[k] = static_cast<std::uint32_t>(
+                span > 0xffffffffull ? 0xffffffffu : span);
+            const std::uint64_t gap = stat_poll_tsc > shards[0]->last_poll_seen
+                ? static_cast<std::uint64_t>(
+                      (stat_poll_tsc - shards[0]->last_poll_seen) / tps)
+                : 0;
+            shards[0]->stat_gap[k] = static_cast<std::uint32_t>(
+                gap > 0xffffffffull ? 0xffffffffu : gap);
+            const std::uint64_t proc = done_tsc > stat_poll_tsc
+                ? static_cast<std::uint64_t>((done_tsc - stat_poll_tsc) / tps) : 0;
+            shards[0]->stat_proc[k] = static_cast<std::uint32_t>(
+                proc > 0xffffffffull ? 0xffffffffu : proc);
+            const std::uint64_t snd = sent_tsc > done_tsc
+                ? static_cast<std::uint64_t>((sent_tsc - done_tsc) / tps) : 0;
+            shards[0]->stat_send[k] = static_cast<std::uint32_t>(
+                snd > 0xffffffffull ? 0xffffffffu : snd);
+            shards[0]->stat_raw_poll[k] = stat_poll_tsc;
+            shards[0]->stat_raw_body[k] = first_body;
+            shards[0]->stat_raw_done[k] = done_tsc;
+            shards[0]->stat_raw_nic[k] = first_rx;
+            const std::uint64_t blind = shards[0]->last_empty != 0 &&
+                                        stat_poll_tsc > shards[0]->last_empty
+                ? static_cast<std::uint64_t>(
+                      (stat_poll_tsc - shards[0]->last_empty) / tps) : 0;
+            shards[0]->stat_blind[k] = static_cast<std::uint32_t>(
+                blind > 0xffffffffull ? 0xffffffffu : blind);
+        }
+        if (single) shards[0]->last_poll_seen = sent_tsc;
         ef_vi_receive_push(vi.get());
     }
     const double wall = (last_seen - start) / tps / 1e9;
@@ -1198,6 +1389,10 @@ int main(int argc, char** argv) {
     std::printf("signals        %" PRIu64 " (buy %" PRIu64 ", sell %" PRIu64 ")"
                 ", of them in the paced stretch %" PRIu64 "\n",
                 buys + sells, buys, sells, paced_orders);
+    if (shards[0]->paced_seen != 0) {
+        std::printf("paced msgs     %" PRIu64 " went past the counter\n",
+                    shards[0]->paced_seen);
+    }
     std::printf("window msgs    %" PRIu64 ", windows %" PRIu64 ", of them thrown away %"
                 PRIu64 " (%" PRIu64 " messages)\n",
                 window_messages, windows, windows_dropped, dropped_samples);
@@ -1233,7 +1428,7 @@ int main(int argc, char** argv) {
                             over += s->per_window[k].over_ms;
                             worst = std::max(worst, s->per_window[k].worst);
                         }
-                        std::fprintf(w, "%zu,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
+                        std::fprintf(w, "%zu,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%u\n",
                                      k, row, n, over, worst);
                         row += n;
                     }
@@ -1264,7 +1459,7 @@ int main(int argc, char** argv) {
             if (e != nullptr) {
                 std::fprintf(e, "# ticks_per_ns %.6f\n", tsc::ticks_per_ns());
                 std::fputs("window,rx_ns,latency_ns,poll_n,poll_i,sym,"
-                           "poll_tsc,in_tsc,out_tsc,fill_tsc,tcp_tsc,ring_tsc\n", e);
+                           "poll_tsc,body_tsc,in_tsc,out_tsc,fill_tsc,tcp_tsc,ring_tsc\n", e);
                 std::uint64_t rows = 0;
                 for (const auto& s : shards) {
                     const std::size_t have =
@@ -1273,10 +1468,12 @@ int main(int argc, char** argv) {
                         std::fprintf(e,
                                      "%u,%" PRIu64 ",%" PRIu64 ",%u,%u,%u,"
                                      "%" PRIu64 ",%" PRIu64 ",%" PRIu64
-                                     ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
+                                     ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+                                     ",%" PRIu64 "\n",
                                      s->raw_window[i], s->raw_rx[i], s->raw.data()[i],
                                      s->raw_polln[i], s->raw_polli[i], s->raw_sym[i],
-                                     s->raw_poll[i], s->raw_in[i], s->raw_out[i],
+                                     s->raw_poll[i], s->raw_body[i], s->raw_in[i],
+                                     s->raw_out[i],
                                      s->raw_s1[i], s->raw_s2[i], s->raw_s3[i]);
                         ++rows;
                     }
@@ -1358,6 +1555,63 @@ int main(int argc, char** argv) {
                         " p99.9 %" PRIu64 " max %" PRIu64 " over %" PRIu64
                         " polls that found something\n",
                         at[0], at[1], at[2], at[3], biggest, polls);
+            std::uint64_t packets = 0;
+            for (int k = 1; k < 65; ++k) {
+                packets += shards[0]->depth[k] * static_cast<std::uint64_t>(k);
+            }
+            std::uint64_t at_w[4] = {};
+            seen = 0;
+            m = 0;
+            for (int k = 1; k < 65 && m < 4; ++k) {
+                seen += shards[0]->depth[k] * static_cast<std::uint64_t>(k);
+                while (m < 4 && static_cast<double>(seen) >= want[m] * static_cast<double>(packets)) {
+                    at_w[m++] = static_cast<std::uint64_t>(k);
+                }
+            }
+            std::printf("depth by packet p50 %" PRIu64 " p90 %" PRIu64 " p99 %" PRIu64
+                        " p99.9 %" PRIu64 " over %" PRIu64
+                        " packets, i.e. how deep the poll was that carried a packet\n",
+                        at_w[0], at_w[1], at_w[2], at_w[3], packets);
+        }
+    }
+    if (opt.stat != nullptr && shards[0]->stat_used != 0) {
+        std::string made;
+        for (const char* c = opt.stat;; ++c) {
+            if (*c == '/' || *c == 0) {
+                if (!made.empty()) (void)::mkdir(made.c_str(), 0755);
+                if (*c == 0) break;
+            }
+            made.push_back(*c);
+        }
+        const std::string path = std::string(opt.stat) + "/polls_raw.csv";
+        std::FILE* sf = std::fopen(path.c_str(), "w");
+        if (sf == nullptr) std::perror(path.c_str());
+        if (sf != nullptr) {
+            std::fprintf(sf,
+                         "day_ns,packets,itch_msgs,rx_span_ns,idle_ns,proc_ns,send_ns,"
+                         "raw_poll_tsc,raw_body_tsc,raw_done_tsc,raw_nic_ns,blind_ns\n");
+            for (std::size_t k = 0; k < shards[0]->stat_used; ++k) {
+                std::fprintf(sf,
+                             "%" PRIu64 ",%u,%u,%u,%u,%u,%u,%" PRIu64 ",%" PRIu64
+                             ",%" PRIu64 ",%" PRIu64 ",%u\n",
+                             shards[0]->stat_when[k], shards[0]->stat_pkts[k],
+                             shards[0]->stat_msgs[k], shards[0]->stat_span[k],
+                             shards[0]->stat_gap[k], shards[0]->stat_proc[k],
+                             shards[0]->stat_send[k], shards[0]->stat_raw_poll[k],
+                             shards[0]->stat_raw_body[k], shards[0]->stat_raw_done[k],
+                             shards[0]->stat_raw_nic[k], shards[0]->stat_blind[k]);
+            }
+            std::fclose(sf);
+            std::printf("stat rows      %s, %zu polls\n", path.c_str(),
+                        shards[0]->stat_used);
+        }
+    }
+    if (stat_on) {
+        static const char* what[3] = {"drained.fetch_add", "reap", "resend_stale"};
+        for (int q = 0; q < 3; ++q) {
+            std::printf("empty path     %-18s worst %" PRIu64 " ns, over 10us %" PRIu64
+                        " times\n", what[q], shards[0]->empty_worst[q],
+                        shards[0]->empty_over[q]);
         }
     }
     std::printf("card counters  %s\n",
