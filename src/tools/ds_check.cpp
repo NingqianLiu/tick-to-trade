@@ -46,17 +46,34 @@ int listen_side(const char* ip, std::uint16_t port) {
     }
     char buf[65536];
     std::size_t total = 0, reads = 0;
+    std::size_t msgs = 0, bad = 0, held = 0;
+    unsigned char pending[4096];
     for (;;) {
         const ssize_t n = ::recv(c, buf, sizeof(buf), 0);
         if (n <= 0) break;
         total += static_cast<std::size_t>(n);
-        if (++reads <= 3) {
-            std::printf("received %zd bytes: %.*s\n", n,
-                        static_cast<int>(n < 60 ? n : 60), buf);
+        if (reads == 0) {
+            std::printf("first bytes:");
+            for (ssize_t k = 0; k < n && k < 24; ++k)
+                std::printf(" %02x", static_cast<unsigned char>(buf[k]));
+            std::printf("\n");
+        }
+        ++reads;
+        for (ssize_t i = 0; i < n; ++i) {
+            if (held < sizeof(pending)) pending[held++] = static_cast<unsigned char>(buf[i]);
+            if (held < 2) continue;
+            const std::size_t want =
+                2 + (static_cast<std::size_t>(pending[0]) << 8) + pending[1];
+            if (want < 4 || want > sizeof(pending)) { ++bad; held = 0; continue; }
+            if (held < want) continue;
+            if (pending[2] == 'U' && pending[3] == 'O') ++msgs; else ++bad;
+            held = 0;
         }
     }
     std::printf("%zu reads\n", reads);
     std::printf("connection closed after %zu bytes\n", total);
+    std::printf("orders received %zu, unrecognised %zu, %zu bytes left over\n",
+                msgs, bad, held);
     ::close(c);
     ::close(srv);
     return total == 0;
