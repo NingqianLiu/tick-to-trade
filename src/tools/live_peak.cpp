@@ -61,6 +61,8 @@ int main(int argc, char** argv) {
     std::vector<std::uint64_t> last_oid(65536, 0);
     std::uint64_t gap_sum = 0, gap_n = 0, gap_max = 0;
 
+    std::vector<std::uint64_t> type_mine(256, 0), type_all(256, 0);
+
     std::uint64_t live = 0, peak = 0, peak_at = 0, messages = 0, last_ts = 0;
     std::uint64_t live_all = 0, peak_all = 0, peak_all_at = 0;
 
@@ -76,6 +78,10 @@ int main(int argc, char** argv) {
                 ++messages;
                 last_ts = m.timestamp();
                 const char t = m.type();
+                if (t != 'A' && t != 'F' && t != 'D' && t != 'U' &&
+                    t != 'X' && t != 'E' && t != 'C') {
+                    ++type_all[static_cast<unsigned char>(t)];
+                }
                 if (t == 'R') {
                     if (symbols == nullptr) return true;
                     const std::uint16_t sym = itch::read_be<std::uint16_t>(
@@ -93,6 +99,8 @@ int main(int argc, char** argv) {
                     const std::uint64_t oid = itch::read_be<std::uint64_t>(
                         m.body + itch::kAddRefOff);
                     owner[oid] = sym;
+                    ++type_all[static_cast<unsigned char>(t)];
+                    if (mine[sym] != 0) ++type_mine[static_cast<unsigned char>(t)];
                     ++live_all;
                     if (live_all > peak_all) { peak_all = live_all; peak_all_at = last_ts; }
                     if (mine[sym] != 0) {
@@ -109,10 +117,24 @@ int main(int argc, char** argv) {
                     }
                     return true;
                 }
+                if (t == 'X' || t == 'E' || t == 'C') {
+                    const std::uint64_t oid = itch::read_be<std::uint64_t>(
+                        m.body + itch::kCancelRefOff);
+                    ++type_all[static_cast<unsigned char>(t)];
+                    const auto it2 = owner.find(oid);
+                    if (it2 != owner.end() && mine[it2->second] != 0) {
+                        ++type_mine[static_cast<unsigned char>(t)];
+                    }
+                    return true;
+                }
                 if (t == 'D' || t == 'U') {
                     const std::uint64_t oid = itch::read_be<std::uint64_t>(
                         m.body + itch::kDeleteRefOff);
                     const auto it = owner.find(oid);
+                    ++type_all[static_cast<unsigned char>(t)];
+                    if (it != owner.end() && mine[it->second] != 0) {
+                        ++type_mine[static_cast<unsigned char>(t)];
+                    }
                     if (it != owner.end()) {
                         if (live_all > 0) --live_all;
                         if (mine[it->second] != 0 && live > 0) --live;
@@ -153,6 +175,39 @@ int main(int argc, char** argv) {
     if (symbols != nullptr && peak_all > 0) {
         std::printf("  the list is %.1f%% of the market\n", 100.0 * peak / peak_all);
     }
+    std::printf("\n  share of each message type, for the names in the list:\n");
+    const char* names[128] = {};
+    names['A'] = "add"; names['F'] = "add with attribution";
+    names['D'] = "delete"; names['U'] = "replace";
+    names['X'] = "cancel part"; names['E'] = "execute at the posted price";
+    names['C'] = "execute at another price";
+    std::uint64_t mine_total = 0;
+    for (char t : {'A', 'F', 'D', 'U', 'X', 'E', 'C'}) {
+        mine_total += type_mine[static_cast<unsigned char>(t)];
+    }
+    std::printf("    %-4s %-22s %14s %9s\n", "type", "what it is", "messages", "share");
+    for (char t : {'A', 'F', 'D', 'U', 'X', 'E', 'C'}) {
+        const std::uint64_t c = type_mine[static_cast<unsigned char>(t)];
+        std::printf("    %-4c %-22s %14" PRIu64 " %8.2f%%\n", t,
+                    names[static_cast<unsigned char>(t)], c,
+                    mine_total > 0 ? 100.0 * static_cast<double>(c) /
+                                     static_cast<double>(mine_total) : 0.0);
+    }
+    std::printf("    %-4s %-22s %14" PRIu64 " %8.2f%%\n", "", "these seven together",
+                mine_total, 100.0);
+    std::printf("  these seven are %.2f%% of all messages (%" PRIu64 " / %" PRIu64 ")\n",
+                messages > 0 ? 100.0 * static_cast<double>(mine_total) /
+                               static_cast<double>(messages) : 0.0,
+                mine_total, messages);
+    std::uint64_t all_seven = 0;
+    for (char t : {'A', 'F', 'D', 'U', 'X', 'E', 'C'}) {
+        all_seven += type_all[static_cast<unsigned char>(t)];
+    }
+    std::printf("  the list is %.2f%% of those seven across the market (%" PRIu64 " / %" PRIu64 ")\n",
+                all_seven > 0 ? 100.0 * static_cast<double>(mine_total) /
+                                static_cast<double>(all_seven) : 0.0,
+                mine_total, all_seven);
+
     if (gap_n > 0) {
         std::uint64_t lo = ~std::uint64_t{0}, hi = 0, tot = 0;
         for (std::uint64_t c : low6) { if (c < lo) lo = c; if (c > hi) hi = c; tot += c; }

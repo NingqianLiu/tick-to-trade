@@ -56,13 +56,14 @@ struct Options {
     std::uint16_t dst_port_b = 0;
     unsigned shards = 3;
     int cpu_base = 4;
-    std::uint32_t threshold = 88;
+    std::uint32_t threshold = 75;
     std::uint64_t idle_ms = 2000;
     const char* order_ip = nullptr;
     std::uint16_t order_port = 45100;
     const char* order_local = "10.9.9.2";
     const char* stat = nullptr;
     bool own_tcp = true;
+    bool rising = true;
     const char* out = nullptr;
     bool profile = false;
     bool batch_packets = false;
@@ -82,6 +83,8 @@ static_assert(kHeaderRoom + kMaxPerFrame * 50 <= cfg::kOrderSlotBytes,
 static_assert(mintcp::kHeaderLen + kMaxPerFrame * 50 <= cfg::kOrderSlotBytes,
               "our own header and a full message must fit one transmit slot");
 
+constexpr std::size_t kMaxPollEvents = 256;
+
 struct Shard {
     Shard(std::size_t orders, std::size_t level_words, std::uint32_t pct,
           const win::Params& wp)
@@ -92,6 +95,7 @@ struct Shard {
     win::Tracker phase;
     ring::Cursor cursor;
     std::uint64_t messages = 0, applied = 0, buys = 0, sells = 0;
+    std::uint64_t applied_window = 0;
     std::uint64_t gaps = 0, duplicates = 0, lapped = 0;
     std::uint64_t expect_seq = 0;
     bool started = false;
@@ -203,12 +207,23 @@ struct Shard {
     std::vector<std::uint64_t> raw_s1, raw_s2, raw_s3;
     std::vector<std::uint64_t> raw_body;
     std::uint64_t poll_at = 0;
-    std::uint64_t msgs_by_depth[65][33] = {};
+    std::uint64_t msgs_by_depth[kMaxPollEvents + 1][33] = {};
+    std::uint64_t polls_by_touch[8192] = {};
+    std::uint16_t dirty[128] = {};
+    std::uint64_t dirty_rx[128] = {};
+    std::uint16_t dirty_before[128] = {};
+    std::uint8_t dirty_paced[128] = {};
+    std::uint8_t dirty_measured[128] = {};
+    std::uint32_t dirty_n = 0;
+    std::vector<std::uint64_t> prev_top = std::vector<std::uint64_t>(1u << 16, 0);
+    bool rising = true;
     struct PollRec {
         std::uint64_t at;
         std::uint64_t rx;
         std::uint32_t events;
         std::uint32_t orders;
+        std::uint32_t msgs;
+        std::uint32_t all;
     };
     huge::Buffer<PollRec> polls;
     std::size_t poll_rows = 0, poll_room = 0;
@@ -649,6 +664,37 @@ void reap(Shard* self) {
     }
 }
 
+void settle_dirty(Shard* self, bool trading) {
+    for (std::uint32_t i = 0; i < self->dirty_n; ++i) {
+        const std::uint16_t sym = self->dirty[i];
+        const std::uint64_t bid3 = self->book.top3(sym, book::PriceLevels::kBuy);
+        const std::uint64_t ask3 = self->book.top3(sym, book::PriceLevels::kSell);
+        const auto what = self->signal.check(bid3, ask3);
+        const std::uint64_t was = self->prev_top[sym];
+        self->prev_top[sym] = (bid3 << 32) | (ask3 & 0xffffffffull);
+        if (what == book::Imbalance::Signal::kNone) continue;
+        if (self->rising) {
+            const std::uint64_t wb = was >> 32, ws = was & 0xffffffffull;
+            if (wb == 0 && ws == 0) continue;
+            const bool up = bid3 * (wb + ws) > wb * (bid3 + ask3);
+            if (what == book::Imbalance::Signal::kBuy) {
+                if (!up) continue;
+            } else {
+                const bool down = bid3 * (wb + ws) < wb * (bid3 + ask3);
+                if (!down) continue;
+            }
+        }
+        const char side =
+            what == book::Imbalance::Signal::kBuy ? ouch::kBuy : ouch::kSell;
+        if (side == ouch::kBuy) ++self->buys; else ++self->sells;
+        if (self->dirty_paced[i] == 0) continue;
+        ++self->paced_orders;
+        if (trading) send_order(self, sym, side, self->dirty_rx[i],
+                                self->dirty_measured[i] != 0, self->dirty_before[i]);
+    }
+    self->dirty_n = 0;
+}
+
 void take_packet(Shard* self, const std::uint8_t* buf, std::uint32_t len,
                  std::uint64_t hw_ts, unsigned id, unsigned shards,
                  const std::unordered_map<std::string, std::uint32_t>* reference,
@@ -677,7 +723,7 @@ void take_packet(Shard* self, const std::uint8_t* buf, std::uint32_t len,
             ++self->gaps;
         }
         self->expect_seq = seq + count;
-        self->msgs_by_depth[self->poll_n < 65 ? self->poll_n : 64]
+        self->msgs_by_depth[self->poll_n <= kMaxPollEvents ? self->poll_n : kMaxPollEvents]
                            [count < 33 ? count : 32] += 1;
 
         const std::size_t payload = len - eth::kHeaderBytes - mold::kHeaderLen;
@@ -764,6 +810,7 @@ void take_packet(Shard* self, const std::uint8_t* buf, std::uint32_t len,
                 const std::uint64_t t0 = self->profile ? fenced_now() : 0;
                 if (!self->book.apply(m, &touched)) return true;
                 ++self->applied;
+                if (measured) ++self->applied_window;
                 if (self->profile && (self->applied & 0x2fff) == 0) {
                     const std::size_t n = self->book.live();
                     if (n > self->live_peak) self->live_peak = n;
@@ -773,33 +820,26 @@ void take_packet(Shard* self, const std::uint8_t* buf, std::uint32_t len,
                     warm(self);
                     self->since_send = 0;
                 }
-                const std::uint64_t bid3 =
-                    self->book.top3(touched, book::PriceLevels::kBuy);
-                const std::uint64_t ask3 =
-                    self->book.top3(touched, book::PriceLevels::kSell);
-                const std::uint64_t t2 = self->profile ? fenced_now() : 0;
-                const auto what = self->signal.check(bid3, ask3);
-                const std::uint64_t t3 = self->profile ? fenced_now() : 0;
-                if (self->profile) {
-                    self->stage[0].add(t1 - t0);
-                    self->stage[1].add(t2 - t1);
-                    self->stage[3].add(t3 - t2);
+                if (self->profile) self->stage[0].add(t1 - t0);
+                std::uint32_t d = 0;
+                while (d < self->dirty_n && self->dirty[d] != touched) ++d;
+                if (d == self->dirty_n && self->dirty_n < 128) {
+                    self->dirty[self->dirty_n++] = touched;
                 }
-                if (what == book::Imbalance::Signal::kNone) return true;
-                const char side =
-                    what == book::Imbalance::Signal::kBuy ? ouch::kBuy : ouch::kSell;
-                if (side == ouch::kBuy) ++self->buys; else ++self->sells;
-                if (!paced) return true;
-                ++self->paced_orders;
-                const std::uint16_t before =
-                    where == win::Phase::kSettle
-                        ? static_cast<std::uint16_t>(
-                              (self->phase.open() - m.timestamp()) / 10000000 + 1)
-                        : 0;
-                if (trading) send_order(self, touched, side, hw_ts, measured, before);
+                if (d < 128) {
+                    self->dirty_rx[d] = hw_ts;
+                    self->dirty_paced[d] = paced ? 1 : 0;
+                    self->dirty_measured[d] = measured ? 1 : 0;
+                    self->dirty_before[d] =
+                        where == win::Phase::kSettle
+                            ? static_cast<std::uint16_t>(
+                                  (self->phase.open() - m.timestamp()) / 10000000 + 1)
+                            : 0;
+                }
                 return true;
             });
     }
+    if (shards != 1) settle_dirty(self, trading);
 }
 
 void run_shard(Shard* self, unsigned id, unsigned shards, const ring::Ring* r,
@@ -880,6 +920,8 @@ int main(int argc, char** argv) {
                                                          : 0;
         } else if (std::strcmp(a, "--one-order-per-message") == 0) {
             opt.coalesce = false;
+        } else if (std::strcmp(a, "--signal-level") == 0) {
+            opt.rising = false;
         } else if (std::strcmp(a, "--own-tcp") == 0) {
             opt.own_tcp = true;
         } else if (std::strcmp(a, "--stat") == 0 && has) {
@@ -969,6 +1011,9 @@ int main(int argc, char** argv) {
         }
     }
 
+    std::printf("signal         once per poll, %s\n",
+                opt.rising ? "and only when the imbalance moved further that way"
+                           : "every time it is past the threshold");
     std::printf("order path     %s\n",
                 opt.own_tcp ? "our own TCP" : "Onload delegated send");
     std::uint32_t peer_ip = 0, local_ip = 0;
@@ -1059,6 +1104,7 @@ int main(int argc, char** argv) {
     for (unsigned i = 0; i < opt.shards; ++i) {
         shards.push_back(
             std::make_unique<Shard>(orders_each, words_each, opt.threshold, wp));
+        shards.back()->rising = opt.rising;
         shards.back()->skip = skip;
         shards.back()->keep = keep;
         shards.back()->raw.reserve(sample_cap);
@@ -1086,7 +1132,7 @@ int main(int argc, char** argv) {
         shards.back()->raw_body.clear();
         shards.back()->raw_s3.assign(sample_cap, 0);
         shards.back()->raw_s3.clear();
-        shards.back()->poll_room = 10000000;
+        shards.back()->poll_room = 128000000;
         shards.back()->polls.resize(shards.back()->poll_room);
         shards.back()->settle_at.reserve(sample_cap);
         shards.back()->settle_ns.reserve(sample_cap);
@@ -1154,9 +1200,9 @@ int main(int argc, char** argv) {
                 gather == kGatherPrefetch ? "prefetch the batch"
                 : gather == kGatherCopy   ? "copy the batch"
                                           : "none, touch each packet in turn");
-    std::vector<std::uint8_t> copymem(64 * cfg::kRxSlotBytes, 0);
+    std::vector<std::uint8_t> copymem(kMaxPollEvents * cfg::kRxSlotBytes, 0);
     std::uint8_t* const copybuf = copymem.data();
-    constexpr std::size_t kAheadMax = 512;
+    constexpr std::size_t kAheadMax = 4096;
     const std::size_t kAheadMin =
         std::getenv("ITCH_AHEAD_MIN") != nullptr
             ? std::strtoull(std::getenv("ITCH_AHEAD_MIN"), nullptr, 10)
@@ -1214,10 +1260,10 @@ int main(int argc, char** argv) {
     std::uint64_t last_seen = tsc::now(), start = 0;
     std::uint64_t packets = 0, discards = 0;
     std::uint64_t poll_seq = 0;
-    ef_event evs[64];
+    ef_event evs[kMaxPollEvents];
 
     for (;;) {
-        const int n = ef_eventq_poll(vi.get(), evs, 64);
+        const int n = ef_eventq_poll(vi.get(), evs, kMaxPollEvents);
         if (n == 0) {
             if (stat_on && single) shards[0]->last_empty = tsc::now();
             const std::uint64_t e0 = stat_on ? tsc::now() : 0;
@@ -1302,8 +1348,11 @@ int main(int argc, char** argv) {
         }
         const std::uint64_t g2 = timing ? fenced_now() : 0;
         if (single) shards[0]->cur_body = g2;
-        if (single) { shards[0]->poll_msgs = 0; shards[0]->poll_when = 0; }
+        if (single) {
+            shards[0]->poll_msgs = 0; shards[0]->poll_when = 0;
+        }
         const std::uint64_t sent_before = single ? shards[0]->sent : 0;
+        const std::uint64_t applied_before = single ? shards[0]->applied : 0;
         ++poll_seq;
         const bool in_window = single && shards[0]->was == win::Phase::kWindow;
         const std::uint64_t poll_tsc_always = in_window ? g1 : 0;
@@ -1359,7 +1408,13 @@ int main(int argc, char** argv) {
             ++next_post;
             if (ef_vi_receive_init(vi.get(), frames.dma(give), give) < 0) ++discards;
         }
+        if (single) settle_dirty(shards[0].get(), trading);
         const std::uint64_t done_tsc = single ? tsc::now() : 0;
+        const std::uint32_t touched_now =
+            single ? static_cast<std::uint32_t>(shards[0]->applied - applied_before) : 0;
+        if (single) {
+            ++shards[0]->polls_by_touch[touched_now < 8192 ? touched_now : 8191];
+        }
         if (single && trading) flush_orders(shards[0].get());
         const std::uint64_t sent_tsc = single ? tsc::now() : 0;
         if (keep_poll && first_rx != 0) {
@@ -1368,6 +1423,8 @@ int main(int argc, char** argv) {
             rec.rx = first_rx;
             rec.events = static_cast<std::uint32_t>(n);
             rec.orders = static_cast<std::uint32_t>(shards[0]->sent - sent_before);
+            rec.msgs = touched_now;
+            rec.all = shards[0]->poll_msgs;
         }
         if (single && shards[0]->stat_used < shards[0]->stat_when.size()) {
             const std::size_t k = shards[0]->stat_used++;
@@ -1445,6 +1502,7 @@ int main(int argc, char** argv) {
     const bool clean = have_counters && nic::read_drops(opt.intf, &after) && before == after;
 
     std::uint64_t messages = 0, applied = 0, buys = 0, sells = 0;
+    std::uint64_t applied_window = 0;
     std::uint64_t gaps = 0, duplicates = 0, lapped = 0, orphan = 0, live = 0;
     std::uint64_t full = 0, bound = 0, unbound = 0;
     std::uint64_t sent = 0, refused = 0, stamped = 0, no_slot = 0;
@@ -1474,6 +1532,7 @@ int main(int argc, char** argv) {
         pooled.merge(s->latency);
         messages = s->messages;
         applied += s->applied;
+        applied_window += s->applied_window;
         buys += s->buys;
         sells += s->sells;
         gaps += s->gaps;
@@ -1489,6 +1548,10 @@ int main(int argc, char** argv) {
     std::printf("packets        %" PRIu64 "\n", packets);
     std::printf("messages       %" PRIu64 " (each shard saw all of them)\n", messages);
     std::printf("applied        %" PRIu64 " across the shards\n", applied);
+    std::printf("order rate     %" PRIu64 " stamped over %" PRIu64
+                " in-window book touches, %.3f%%\n",
+                stamped, applied_window,
+                applied_window ? 100.0 * double(stamped) / double(applied_window) : 0.0);
     std::printf("orders alive   %" PRIu64 "\n", live);
     std::printf("bound          %" PRIu64 " securities, %" PRIu64 " without a price space\n",
                 bound, unbound);
@@ -1608,11 +1671,11 @@ int main(int argc, char** argv) {
             std::FILE* pf = std::fopen((std::string(opt.out) + "/polls.csv").c_str(), "w");
             if (pf != nullptr) {
                 std::fprintf(pf, "# ticks_per_ns %.6f\n", tsc::ticks_per_ns());
-                std::fputs("tsc,rx_ns,events,orders\n", pf);
+                std::fputs("tsc,rx_ns,events,orders,msgs,all\n", pf);
                 for (std::size_t i = 0; i < shards[0]->poll_rows; ++i) {
                     const Shard::PollRec& r = shards[0]->polls[i];
-                    std::fprintf(pf, "%" PRIu64 ",%" PRIu64 ",%u,%u\n", r.at, r.rx,
-                                 r.events, r.orders);
+                    std::fprintf(pf, "%" PRIu64 ",%" PRIu64 ",%u,%u,%u,%u\n", r.at,
+                                 r.rx, r.events, r.orders, r.msgs, r.all);
                 }
                 std::fclose(pf);
                 std::printf("polls          %s/polls.csv, %zu rows\n", opt.out,
@@ -1621,14 +1684,26 @@ int main(int argc, char** argv) {
             std::FILE* mf = std::fopen((std::string(opt.out) + "/msgs.csv").c_str(), "w");
             if (mf != nullptr) {
                 std::fputs("poll_n,msgs_in_packet,packets\n", mf);
-                for (int dn = 0; dn < 65; ++dn) {
+                for (std::size_t dn = 0; dn <= kMaxPollEvents; ++dn) {
                     for (int mc = 0; mc < 33; ++mc) {
                         const std::uint64_t v = shards[0]->msgs_by_depth[dn][mc];
-                        if (v != 0) std::fprintf(mf, "%d,%d,%" PRIu64 "\n", dn, mc, v);
+                        if (v != 0) {
+                            std::fprintf(mf, "%zu,%d,%" PRIu64 "\n", dn, mc, v);
+                        }
                     }
                 }
                 std::fclose(mf);
                 std::printf("packet fill    %s/msgs.csv\n", opt.out);
+            }
+            std::FILE* tf = std::fopen((std::string(opt.out) + "/touch.csv").c_str(), "w");
+            if (tf != nullptr) {
+                std::fputs("book_msgs_in_poll,polls\n", tf);
+                for (int k = 0; k < 8192; ++k) {
+                    const std::uint64_t v = shards[0]->polls_by_touch[k];
+                    if (v != 0) std::fprintf(tf, "%d,%" PRIu64 "\n", k, v);
+                }
+                std::fclose(tf);
+                std::printf("book touches   %s/touch.csv\n", opt.out);
             }
             std::FILE* c = std::fopen((std::string(opt.out) + "/settle.csv").c_str(), "w");
             if (c != nullptr) {

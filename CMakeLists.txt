@@ -8,7 +8,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Sender and receiver are two processes on this one host, so nothing has to run
 # anywhere else and the build can use everything the CPU offers.
 set(ITCH_ARCH "native" CACHE STRING "value passed to -march")
-add_compile_options(-O3 -march=${ITCH_ARCH} -Wall -Wextra)
+set(ITCH_OPT "-O3" CACHE STRING "optimisation level, so -O2 and -O3 can be compared")
+add_compile_options(${ITCH_OPT} -march=${ITCH_ARCH} -Wall -Wextra)
 
 add_library(itch INTERFACE)
 target_include_directories(itch INTERFACE ${CMAKE_SOURCE_DIR}/src)

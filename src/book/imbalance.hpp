@@ -8,7 +8,7 @@ class Imbalance {
 public:
     enum class Signal : std::uint8_t { kNone, kBuy, kSell };
 
-    explicit constexpr Imbalance(std::uint32_t percent = 88) noexcept : pct_(percent) {}
+    explicit constexpr Imbalance(std::uint32_t percent = 75) noexcept : pct_(percent) {}
 
     [[nodiscard]] constexpr Signal check(std::uint64_t bid3,
                                          std::uint64_t ask3) const noexcept {
