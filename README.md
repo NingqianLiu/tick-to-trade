@@ -1,99 +1,149 @@
 # Wire-to-wire on this machine
 
-Every chart below is wire-to-wire nanoseconds: the card stamping the first byte of a
-market data frame arriving, to the card stamping the first byte of the order it caused
-leaving. The y axis is linear in every one of them and starts at zero, so the tail is not
-flattened by a log scale. All of it is one Solarflare SFN8522 on an AMD EPYC 7K62,
-replaying real Nasdaq ITCH.
+Wire-to-wire is the only number here: the card stamps the market data frame coming in and
+the order going out, and everything between is mine. Microseconds, linear axis from zero.
+
+The market data is a whole day of real Nasdaq ITCH, downloaded from
+`https://emi.nasdaq.com/ITCH/Nasdaq%20ITCH/`, and it is replayed over a real link.
+
+The hardware is old and it shows. On a current Intel CPU and card I think a p50 under a
+microsecond is reachable. Mine is a 7 year old AMD at 3.31 GHz with no DDIO, so packets
+land in memory rather than L3; a core reaches only 16 MB of L3 and the book is far bigger,
+so a lookup waits 120 ns on DRAM. The card is a 10 year old SFN8522-PLUS with no CTPIO, so
+it takes the whole frame in before any of it goes out.
 
 ## Where it stands now
 
 ![v10 over a full session](charts/v10_full_day.svg)
 
-Nothing skipped: six and a half hours of wall clock, 912 million messages, 3,893,353
-orders, 3.89 million latency samples and not one of them dropped.
+One session, 09:30 to 16:00, at the speed it happened, nothing skipped: 912 million
+messages in and 3,893,353 orders out, which is 3.9% of the Nasdaq-100 messages that
+change a book.
 
-## What each version bought
+The signal, per name, in shares resting on the book:
 
-Each technique gets a branch of its own and is measured against the version before it,
-run in the same sitting. Ten baselines so far. Every chart carries the parameters of the
-round in its title: which day, how many windows out of the day, the replay speed, which
-names have books, and how many shards. Where a percentile is missing from a line, that
-round did not record it.
+1) `r = (bid1 + bid2 + bid3) / (bid1 + bid2 + bid3 + ask1 + ask2 + ask3)`
+2) `r` over 75% and bigger than the last time this name fired: buy. Under 25% and smaller
+   than last time: sell. Anything else, nothing.
+3) One share, immediate or cancel, taking the other side.
 
-![v1 to v2](charts/v1_v2.svg)
-
-Nothing in the gateway changed. The reserved cores were not actually reserved: an ssh
-tunnel woke on one of them every ninety seconds, and reading a UEFI variable stalls every
-core on both sockets for 1.13 ms.
-
-![v2 to v3](charts/v2_v3.svg)
-
-The whole feed is still taken in, but books are kept only for the Nasdaq-100, and one
-core now does everything instead of one poller feeding three shards. The tail looks like a
-disaster and is not one: the number of samples fell 4.6x with the shorter list, so the same
-few thousand slow samples now sit at a much higher percentile. Counted as orders rather
-than percentiles, 1,537-4,480 of them passed a millisecond before and 4,686 after.
-
-![v3 to v4](charts/v3_v4.svg)
-
-Telling the stack what went out costs 810 ns and is paid once per message, not once per
-order. Orders now fill a message and go when it is full or when the poll ends.
-
-![v4 to v5](charts/v4_v5.svg)
-
-The order path is our own TCP: fill the fields, lay a fifty-four byte header in front,
-work out the checksums, ring the card. 1,540 ns became 110 ns.
-
-![v5 to v6](charts/v5_v6.svg)
-
-Instrumentation only — four timed segments per poll, off by default. Nothing on the hot
-path was meant to change, and this is the honest picture of a round that says otherwise.
-
-![v6 to v7](charts/v6_v7.svg)
-
-Market data and the exchange's acknowledgements shared one receive queue, so during a
-burst the acknowledgement that frees the send window sat behind thousands of packets. The
-queue and the thread both moved.
-
-![v7 to v8](charts/v7_v8.svg)
-
-The strategy ran on every message that touched a book. One poll can carry hundreds of
-messages for one security. It now runs once per poll, and only when the imbalance has
-moved further than last time.
-
-![v8 to v9](charts/v8_v9.svg)
-
-Parsing, book building and the strategy used to be interleaved. They are now three steps
-taken in turn over the whole poll, and the order table lookups inside one pass no longer
-wait on each other.
-
-![v9 to v10](charts/v9_v10.svg)
-
-Three changes, one per layer: the day-phase is computed once per packet rather than once
-per message, the add pass is split into three loops that touch unrelated memory, and the
-card computes both checksums so we stop computing one it was overwriting anyway.
-
----
+The card is 10 GbE and one port sends while the other receives, so the A and B feeds share
+one link. That is the ceiling on how fast packets can reach the CPU: on the busiest
+stretch the link stays full for 857 μs on one feed, twice that with both.
 
 ## Where the time goes
 
-All of these are measured on this machine, in nanoseconds. The six rows under `work` add
-up to `work`. There is no row for a pre-trade risk check, because it is not built.
-
-| | what it is | p50 | p90 | p99 | p99.9 | max |
+| | what it is | p50 ns | p90 ns | p99 ns | p99.9 ns | max ns |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | `wait` | packet arrives, until we are told about it | 99 | 300 | 744 | 1,254 | 2,982 |
 | `fetch` | pick the packet up (issue the prefetch, do not wait on it) | 40 | 40 | 50 | 70 | 250 |
-| `work` | book update, signal, and building the order | 620 | 890 | 1,360 | 1,930 | 3,050 |
-| `parse` | parse the ITCH messages and sort them | 180 | 320 | 470 | 730 | 1,960 |
-| `book` | apply them to the book in seven passes | 160 | 280 | 530 | 810 | 1,540 |
-| `signal` | check the signal | 90 | 120 | 380 | 790 | 1,720 |
-| `fields` | write the 5 fields of the order that change | 40 | 50 | 100 | 340 | 750 |
-| `header` | TCP header and the two checksums | 130 | 200 | 470 | 640 | 880 |
-| `doorbell` | ring the doorbell | 20 | 30 | 50 | 140 | 410 |
-| `send` | handed to the card, until the bytes are on the wire | 2,453 | 2,570 | 2,869 | 7,246 | 18,998 |
+| `work` | book update, signal, and building the order, DRAM waits included | 620 | 890 | 1,360 | 1,930 | 3,050 |
+| `work 1: parse` | parse the ITCH messages and sort them | 180 | 320 | 470 | 730 | 1,960 |
+| `work 2: book` | apply them to the book in seven passes | 160 | 280 | 530 | 810 | 1,540 |
+| `work 3: signal` | check the signal | 90 | 120 | 380 | 790 | 1,720 |
+| `work 4: fields` | write the 5 fields of the order that change | 40 | 50 | 100 | 340 | 750 |
+| `work 5: header` | TCP header and the two checksums | 130 | 200 | 470 | 640 | 880 |
+| `work 6: doorbell` | ring the doorbell | 20 | 30 | 50 | 140 | 410 |
+| **`send`** | **handed to the card, until the bytes are on the wire** | **2,453** | **2,570** | **2,869** | **7,246** | **18,998** |
 | `total` | wire-to-wire, all of it | 3,248 | 3,636 | 4,232 | 4,873 | 7,294 |
+
+`wait` and `send` are timed across two clocks, the card's and the CPU's, so they can come
+out too big — that is why `send` is above `total` at p99.9 and at the max.
+
+## What each version bought
+
+One technique per branch, measured against the version before it, the two run in turn.
+
+![v1 to v2](charts/v1_v2.svg)
+
+What v2 did (no code changed):
+
+1) Kept other work off the reserved cores. An ssh tunnel woke on one every ninety seconds.
+2) isolcpus stops the scheduler putting work on a core. It does not stop anyone else.
+3) Stopped reading UEFI variables during a run — one read freezes both sockets for 1.13 ms.
+4) After a freeze the replay catches up at full speed, so a millisecond arrives at once.
+
+![v2 to v3](charts/v2_v3.svg)
+
+What v3 did:
+
+1) Books only for the Nasdaq-100. The whole feed still comes in; Nasdaq sends one stream.
+2) One core does the whole job, where before it took a poller and three shards.
+3) The short list did not move the median. Dropping the handoff between cores did, 218-417 ns.
+4) What the short list buys is that one core can keep up at all.
+
+Do not read too much into the latency here — the two sides no longer carry the same load.
+The Nasdaq-100 is about 11% of the market's messages, and one core carries that where
+three used to carry everything.
+
+![v3 to v4](charts/v3_v4.svg)
+
+What v4 did:
+
+1) Several orders now share one message, sent when it fills or when the poll ends.
+2) Sending one costs 870 ns, and 810 of that is per message, not per order.
+3) So a poll that fired eighty orders used to pay it eighty times.
+4) It costs 90 ns at the median: the first order waits for the rest.
+
+![v4 to v5](charts/v4_v5.svg)
+
+What v5 did:
+
+1) The order path is my own TCP now: 110 ns, against 1,540 through the stack.
+2) 1,090 of that 1,540 was one call, and it runs after the card has been rung.
+3) So it never held up its own order, only the ones behind it — a tail cost, not a median one.
+
+![v5 to v6](charts/v5_v6.svg)
+
+What v6 did:
+
+1) Time stamps at five points, so wire-to-wire breaks into four segments.
+2) That showed the wait before I see a packet is my own doing — I am still busy with the
+   last batch instead of looking.
+3) Added a switch that turns the book and the signal off, to see the floor under them.
+4) A record, not a result: the machine changed here too, not only the code.
+
+![v6 to v7](charts/v6_v7.svg)
+
+What v7 did:
+
+1) The exchange's replies get their own receive queue, out from behind the market data.
+2) And their own thread — one thread on both queues is still stuck in the same batch.
+3) Over the closing ten minutes at full speed, 9,485 refused orders became 0.
+4) The median does not move: reading the reply on another core costs about 89 ns.
+
+![v7 to v8](charts/v7_v8.svg)
+
+What v8 did:
+
+1) The signal is judged once per poll, not once per message.
+2) One poll can carry hundreds of messages for the same name.
+3) And it fires only when the balance tips further than the last time.
+4) It still sends about as many orders, 4.79% down to 4.49%, so this is not trading less.
+
+**From here a round is 09:30 to 10:10 at 50x speed. Everything left to fix is in the tail,
+and at real speed the moments that make a tail hardly come round at all. Running the
+replay fifty times faster leans on the code hard enough that its weak spots show, and then
+the old and the new version can be told apart.**
+
+![v8 to v9](charts/v8_v9.svg)
+
+What v9 did:
+
+1) A whole poll is sorted into four buckets by message type and walked in seven passes.
+2) Lookups in one pass do not depend on each other, so the memory waits overlap.
+3) It is not doing less work — the seven passes skip 0.1% of the price level writes.
+4) A replace is split across four passes, so its two halves are looked up once.
+
+![v9 to v10](charts/v9_v10.svg)
+
+What v10 did:
+
+1) By now there is not much left to take out, so this pass is the tool I like best:
+   instruction and memory level parallelism, which means giving the CPU several
+   independent things to wait on at once instead of one after another. On work that is
+   mostly arithmetic it is worth about 1.5x, and on work that keeps missing cache up to
+   about 4x, because waiting on four lines at once costs about what waiting on one costs.
 
 ---
 
