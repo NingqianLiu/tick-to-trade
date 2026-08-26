@@ -8,7 +8,7 @@ replaying real Nasdaq ITCH.
 
 ## Where it stands now
 
-![v10 over a full session](results/readme_v10_full_day.svg)
+![v10 over a full session](charts/v10_full_day.svg)
 
 Nothing skipped: six and a half hours of wall clock, 912 million messages, 3,893,353
 orders, 3.89 million latency samples and not one of them dropped.
@@ -21,13 +21,13 @@ round in its title: which day, how many windows out of the day, the replay speed
 names have books, and how many shards. Where a percentile is missing from a line, that
 round did not record it.
 
-![v1 to v2](results/readme_v1_v2.svg)
+![v1 to v2](charts/v1_v2.svg)
 
 Nothing in the gateway changed. The reserved cores were not actually reserved: an ssh
 tunnel woke on one of them every ninety seconds, and reading a UEFI variable stalls every
 core on both sockets for 1.13 ms.
 
-![v2 to v3](results/readme_v2_v3.svg)
+![v2 to v3](charts/v2_v3.svg)
 
 The whole feed is still taken in, but books are kept only for the Nasdaq-100, and one
 core now does everything instead of one poller feeding three shards. The tail looks like a
@@ -35,40 +35,40 @@ disaster and is not one: the number of samples fell 4.6x with the shorter list, 
 few thousand slow samples now sit at a much higher percentile. Counted as orders rather
 than percentiles, 1,537-4,480 of them passed a millisecond before and 4,686 after.
 
-![v3 to v4](results/readme_v3_v4.svg)
+![v3 to v4](charts/v3_v4.svg)
 
 Telling the stack what went out costs 810 ns and is paid once per message, not once per
 order. Orders now fill a message and go when it is full or when the poll ends.
 
-![v4 to v5](results/readme_v4_v5.svg)
+![v4 to v5](charts/v4_v5.svg)
 
 The order path is our own TCP: fill the fields, lay a fifty-four byte header in front,
 work out the checksums, ring the card. 1,540 ns became 110 ns.
 
-![v5 to v6](results/readme_v5_v6.svg)
+![v5 to v6](charts/v5_v6.svg)
 
 Instrumentation only — four timed segments per poll, off by default. Nothing on the hot
 path was meant to change, and this is the honest picture of a round that says otherwise.
 
-![v6 to v7](results/readme_v6_v7.svg)
+![v6 to v7](charts/v6_v7.svg)
 
 Market data and the exchange's acknowledgements shared one receive queue, so during a
 burst the acknowledgement that frees the send window sat behind thousands of packets. The
 queue and the thread both moved.
 
-![v7 to v8](results/readme_v7_v8.svg)
+![v7 to v8](charts/v7_v8.svg)
 
 The strategy ran on every message that touched a book. One poll can carry hundreds of
 messages for one security. It now runs once per poll, and only when the imbalance has
 moved further than last time.
 
-![v8 to v9](results/readme_v8_v9.svg)
+![v8 to v9](charts/v8_v9.svg)
 
 Parsing, book building and the strategy used to be interleaved. They are now three steps
 taken in turn over the whole poll, and the order table lookups inside one pass no longer
 wait on each other.
 
-![v9 to v10](results/readme_v9_v10.svg)
+![v9 to v10](charts/v9_v10.svg)
 
 Three changes, one per layer: the day-phase is computed once per packet rather than once
 per message, the add pass is split into three loops that touch unrelated memory, and the
