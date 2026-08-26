@@ -121,6 +121,8 @@ What v8 did:
 3) And it fires only when the balance tips further than the last time.
 4) It still sends about as many orders, 4.79% down to 4.49%, so this is not trading less.
 
+---
+
 **From here a round is 09:30 to 10:10 at 50x speed. Everything left to fix is in the tail,
 and at real speed the moments that make a tail hardly come round at all. Running the
 replay fifty times faster leans on the code hard enough that its weak spots show, and then
