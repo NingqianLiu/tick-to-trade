@@ -132,10 +132,11 @@ the old and the new version can be told apart.**
 
 What v9 did:
 
-1) A whole poll is sorted into four buckets by message type and walked in seven passes.
-2) Lookups in one pass do not depend on each other, so the memory waits overlap.
-3) It is not doing less work — the seven passes skip 0.1% of the price level writes.
-4) A replace is split across four passes, so its two halves are looked up once.
+1) Instead of finishing one message before moving to the next, I group a batch by type and
+   walk it seven times.
+2) Each lookup in a pass is for a different order, so the CPU waits for all of them at once.
+3) The gain is not doing less — the seven passes save 0.1% of the writes to the book.
+4) A replace is a cancel plus a new order, so it is spread over four of the passes.
 
 ![v9 to v10](charts/v9_v10.svg)
 
