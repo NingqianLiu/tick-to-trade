@@ -1,16 +1,21 @@
 # Wire-to-wire on this machine
 
-Wire-to-wire is the only number here: the card stamps the market data frame coming in and
-the order going out, and everything between is mine. Microseconds, linear axis from zero.
+Wire-to-wire is the only number here: the Solarflare NIC stamps the first byte of the
+market data frame coming in and the first byte of the order going out, and everything
+between is mine.
+
+On a current CPU with DDIO at 5 GHz or more, a Solarflare X4522 NIC, PCIe and the bare
+ef_vi receive and send path cost about 575 ns. The 620 ns work segment here runs on my old
+CPU at 3.31 GHz and carries the DRAM read latency; on that machine it should come down to
+about 400 ns. With the latest hardware I think a wire-to-wire p50 < 1 μs is reachable.
+
+Mine is a 7 year old AMD at 3.31 GHz with no DDIO, so packets land in memory rather than
+L3; a core reaches only 16 MB of L3 and the book is far bigger, so a lookup waits 120 ns
+on DRAM. The card is a 10 year old SFN8522-PLUS with no CTPIO, so it takes the whole frame
+in before any of it goes out.
 
 The market data is a whole day of real Nasdaq ITCH, downloaded from
 `https://emi.nasdaq.com/ITCH/Nasdaq%20ITCH/`, and it is replayed over a real link.
-
-The hardware is old and it shows. On a current Intel CPU and card I think a p50 under a
-microsecond is reachable. Mine is a 7 year old AMD at 3.31 GHz with no DDIO, so packets
-land in memory rather than L3; a core reaches only 16 MB of L3 and the book is far bigger,
-so a lookup waits 120 ns on DRAM. The card is a 10 year old SFN8522-PLUS with no CTPIO, so
-it takes the whole frame in before any of it goes out.
 
 ## Where it stands now
 
@@ -37,7 +42,7 @@ stretch the link stays full for 857 μs on one feed, twice that with both.
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | `wait` | packet arrives, until we are told about it | 99 | 300 | 744 | 1,254 | 2,982 |
 | `fetch` | pick the packet up (issue the prefetch, do not wait on it) | 40 | 40 | 50 | 70 | 250 |
-| `work` | book update, signal, and building the order, DRAM waits included | 620 | 890 | 1,360 | 1,930 | 3,050 |
+| **`work` (3.31 GHz, DRAM read latency included)** | **all of `work 1` to `work 6`** | **620** | **890** | **1,360** | **1,930** | **3,050** |
 | `work 1: parse` | parse the ITCH messages and sort them | 180 | 320 | 470 | 730 | 1,960 |
 | `work 2: book` | apply them to the book in seven passes | 160 | 280 | 530 | 810 | 1,540 |
 | `work 3: signal` | check the signal | 90 | 120 | 380 | 790 | 1,720 |
@@ -49,6 +54,9 @@ stretch the link stays full for 857 μs on one feed, twice that with both.
 
 `wait` and `send` are timed across two clocks, the card's and the CPU's, so they can come
 out too big — that is why `send` is above `total` at p99.9 and at the max.
+
+`fetch`, `work`, `work 1` to `work 6` and `total` each start and end on one clock, so
+those numbers are exact.
 
 ## What each version bought
 
@@ -135,8 +143,6 @@ What v9 did:
 1) Instead of finishing one message before moving to the next, I group a batch by type and
    walk it seven times.
 2) Each lookup in a pass is for a different order, so the CPU waits for all of them at once.
-3) The gain is not doing less — the seven passes save 0.1% of the writes to the book.
-4) A replace is a cancel plus a new order, so it is spread over four of the passes.
 
 ![v9 to v10](charts/v9_v10.svg)
 
@@ -236,7 +242,7 @@ If the standard deviation of that gap is 500 ns, then every 50 ns I cut off wire
 
 ### FPGA vs CPU past ~300 serial cycles
 
-An FPGA is a bad fit for a strategy with a long dependency chain. One FPGA clock cycle is 4 ns, while a CPU cycle can be 0.17 ns. Under kernel bypass, one round trip between an HFT NIC and the CPU (not counting CPU compute) is about 1–1.5 μs — that is what the FPGA saves you.
+An FPGA is a bad fit for a strategy with a long dependency chain. One FPGA clock cycle is 4 ns, while a CPU cycle can be 0.2 ns. Under kernel bypass, one round trip between an HFT NIC and the CPU (not counting CPU compute) is about 1–1.5 μs — that is what the FPGA saves you.
 
 So once the FPGA's serial chain is deeper than about 300 clock cycles, it is not worth using any more. FPGA development is also slow.
 
