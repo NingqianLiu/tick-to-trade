@@ -79,6 +79,7 @@ What v3 did:
 2) One core does the whole job, where before it took a poller and three shards.
 3) The short list did not move the median. Dropping the handoff between cores did, 218-417 ns.
 4) What the short list buys is that one core can keep up at all.
+5) The tail gets worse in this version, because three shards became one.
 
 Do not read too much into the latency here — the two sides no longer carry the same load.
 The Nasdaq-100 is about 11% of the market's messages, and one core carries that where
@@ -110,6 +111,7 @@ What v6 did:
    last batch instead of looking.
 3) Added a switch that turns the book and the signal off, to see the floor under them.
 4) A record, not a result: the machine changed here too, not only the code.
+5) The path did not change here. The numbers are a little worse only because I added rdtsc and lfence to measure it.
 
 ![v6 to v7](charts/v6_v7.svg)
 
@@ -138,21 +140,23 @@ the old and the new version can be told apart.**
 
 ![v8 to v9](charts/v8_v9.svg)
 
-What v9 did:
+What v9 did: ⭐
 
 1) Instead of finishing one message before moving to the next, I group a batch by type and
    walk it seven times.
-2) Each lookup in a pass is for a different order, so the CPU waits for all of them at once.
+2) Each lookup in a pass is for a different order, so the CPU waits for all of them at
+   once. That is MLP.
 
 ![v9 to v10](charts/v9_v10.svg)
 
-What v10 did:
+What v10 did: ⭐
 
-1) By now there is not much left to take out, so this pass is the tool I like best:
-   instruction and memory level parallelism, which means giving the CPU several
-   independent things to wait on at once instead of one after another. On work that is
-   mostly arithmetic it is worth about 1.5x, and on work that keeps missing cache up to
-   about 4x, because waiting on four lines at once costs about what waiting on one costs.
+1) By now there is not much left to take out except in parsing, so this pass is still the
+   tool I like best: instruction and memory level parallelism, which means giving the CPU
+   several independent things to wait on at once instead of one after another. On work
+   that is mostly arithmetic it is worth about 1.5x, and on work that keeps missing cache
+   up to about 4x, because waiting on four lines at once costs about what waiting on one
+   costs.
 
 ---
 
@@ -171,6 +175,7 @@ What v10 did:
 
 - [ROB: out-of-order execution, in-order retire](#rob)
 - [Past ~22 loads the queue backs up, nothing is dropped](#prefetch)
+- [MLP in flight = min(LFB, window/L, work on hand)](#mlp) ⭐
 - [if and ?: give the same asm; cmov is not free](#cmov)
 - [One store per cycle, 32 B wide, and not atomic](#store)
 
@@ -279,6 +284,46 @@ tracking slots full  it cannot retire, so it sits in the load queue and waits
 ```
 
 So what happens is not a drop, it is back pressure. Once the load queue is full the front end cannot put any instruction in at all, so what stalls is not only memory — it is the whole pipeline.
+
+<a id="mlp"></a>
+
+### MLP in flight = min(LFB, window/L, work on hand)
+
+This is my own experience; I could not find much guidance written down on it. However, this particular approach is one of the most effective for low-latency systems
+
+```
+M = min( LFB , W / L , independent misses on hand )
+cost per miss = miss latency / M
+```
+
+`M` is the in-flight MLP number, and I want it bigger. Once it reaches `LFB` there is no room left.
+
+```
+LFB   miss tracking slots. Any L1 miss takes one, and a DRAM read holds it ten
+      times longer than an L3 hit, so DRAM is what runs them out.
+
+W     the out-of-order window, counted in instructions, roughly 120-240.
+      It is not one fixed number per CPU: whichever of these runs out first
+      sets it, so it also depends on what the loop is made of.
+        ROB   every instruction that has not retired takes a slot
+        PRF   an instruction that writes a register takes one more
+        LDQ   an instruction that reads memory takes one more
+        STQ   an instruction that writes memory takes one more (the store buffer)
+
+L     instructions in the loop body / how many of them really miss cache
+```
+
+Published sizes for the newest cores, for a sense of scale:
+
+| | AMD Zen 5 | Intel Lion Cove |
+| --- | ---: | ---: |
+| ROB | 448 | 576 |
+| integer PRF | 240 | not published |
+| load queue | 202 | 80 |
+| store queue | 104 | 58 |
+| L1 miss tracking | 124 | 24, plus 80 L2 miss queues |
+
+These are the sizes of the structures, not what a loop actually reaches.
 
 <a id="cmov"></a>
 
