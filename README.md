@@ -198,12 +198,7 @@ What v11 did:
 
 ## Contents
 
-**1. Where the latency goes**
-
-- [Measure the latency gap versus competitors, not my average](#delta)
-- [FPGA vs CPU: the order is in the FPGA before the tick](#fpga)
-
-**2. Inside the core**
+**1. Inside the core**
 
 - [ROB: out-of-order execution, in-order retire](#rob)
 - [Past ~22 loads the queue backs up, nothing is dropped](#prefetch)
@@ -211,7 +206,7 @@ What v11 did:
 - [if and ?: give the same asm; cmov is not free](#cmov)
 - [One store per cycle, 32 B wide, and not atomic](#store)
 
-**3. Multicore: the real lock is the cacheline**
+**2. Multicore: the real lock is the cacheline**
 
 - [RFO on every shared write: 10–300 ns](#rfo) ⭐
 - [atomic over volatile; mutex at cacheline level](#volatile)
@@ -221,13 +216,13 @@ What v11 did:
 - [Spurious CAS failure comes from LL/SC, not from x86](#weak)
 - [Store buffer makes the SPSC snapshot to shm nearly free](#storebuf) ⭐
 
-**4. Memory ordering**
+**3. Memory ordering**
 
 - [acquire/release is free on x86; seq_cst store 20–30 cyc](#mo-cost)
 - [seq_cst buys one order all threads agree on](#seqcst)
 - [CAS success / failure memory orderings](#cas-mo)
 
-**5. Page tables, kernel, cache**
+**4. Page tables, kernel, cache**
 
 - [Segfault: no mapping for that virtual address](#segv)
 - [Soft page fault on the first write after new](#pf)
@@ -235,7 +230,7 @@ What v11 did:
 - [free() over 128 KB: TLB shootdown IPI](#ipi) ⭐
 - [A 4096 B stride only fits 8 lines in L1D](#l1d)
 
-**6. C++ on the hot path**
+**5. C++ on the hot path**
 
 - [One std::string allocation walks 5 tiers, up to 1–2 μs](#string)
 - [Cross-thread free empties the producer's tcache](#tcache)
@@ -249,44 +244,25 @@ What v11 did:
 - [views::split beats find and substr for cutting fields](#split)
 - [std::byteswap for the big-endian wire format](#byteswap)
 
-**7. Measuring and verifying**
+**6. Measuring and verifying**
 
 - [rdtsc needs lfence; rdtscp returns a core id](#rdtsc)
 - [Checking with objdump whether the optimization happened](#objdump)
 
-**8. Parsing**
+**7. Parsing**
 
 - [MoldUDP64 + ITCH: fixed offsets, cut in place](#itch)
 
-**9. Solarflare / kernel bypass**
+**8. Solarflare / kernel bypass**
 
 - [CTPIO cut-through](#sfc)
 - [More spinning cores make the NIC write land later](#dma)
 - [Abandoning Onload: Onload takes 1,090 ns per call, and costs 23 μs more at p99.9](#mintcp) ⭐
+- [FPGA vs CPU: the order is in the FPGA before the tick](#fpga)
 
 ---
 
-## 1. Where the latency goes
-
-<a id="delta"></a>
-
-### Measure the latency gap versus competitors, not my average
-
-Low-latency work needs more than my own latency at each point in time. It needs the gap between when I get the data and when my competitor gets it.
-
-Two numbers from my own trades show that gap: my win rate when several of us go for one price in the same microsecond, and whether my resting order is pulled in time when the market moves.
-
-<a id="fpga"></a>
-
-### FPGA vs CPU: the order is in the FPGA before the tick
-
-One FPGA clock cycle is 4 ns, while a CPU cycle can be 0.2 ns, but the FPGA does far more in one of them. Under kernel bypass, one round trip between an HFT NIC and the CPU is about 0.5–2 μs, which is what kernel bypass pays and an FPGA does not.
-
-Before the tick the CPU builds the order bytes and the condition that fires them, and writes both into the FPGA. The condition is one comparison, a price crossing a level. On the tick the FPGA compares and sends bytes it already holds. The condition is only right for the book the CPU last saw, so the cost is rewriting it as the book moves.
-
----
-
-## 2. Inside the core
+## 1. Inside the core
 
 <a id="rob"></a>
 
@@ -396,7 +372,7 @@ In practice I cannot catch one being split on Zen 2: it is one μop and the whol
 
 ---
 
-## 3. Multicore: the real lock is the cacheline
+## 2. Multicore: the real lock is the cacheline
 
 <a id="rfo"></a>
 
@@ -615,7 +591,7 @@ Related: if another core's work depends on this store buffer write — SPSC is e
 
 ---
 
-## 4. Memory ordering
+## 3. Memory ordering
 
 <a id="mo-cost"></a>
 
@@ -697,7 +673,7 @@ In most cases (or as the no-brainer default):
 
 ---
 
-## 5. Page tables, kernel, cache
+## 4. Page tables, kernel, cache
 
 <a id="segv"></a>
 
@@ -813,7 +789,7 @@ Also, the address here is the virtual address, not the physical address after PT
 
 ---
 
-## 6. C++ on the hot path
+## 5. C++ on the hot path
 
 <a id="string"></a>
 
@@ -1050,7 +1026,7 @@ uint32_t host = std::byteswap(net_value);   // one call flips the byte order
 
 ---
 
-## 7. Measuring and verifying
+## 6. Measuring and verifying
 
 <a id="rdtsc"></a>
 
@@ -1128,7 +1104,7 @@ objdump -d -C -Mintel \
 
 ---
 
-## 8. Parsing
+## 7. Parsing
 
 <a id="itch"></a>
 
@@ -1161,7 +1137,7 @@ ITCH decoding is done a fixed way: `0x41` and `0x44` are `'A'` and `'D'`, and ho
 
 ---
 
-## 9. Solarflare / kernel bypass
+## 8. Solarflare / kernel bypass
 
 <a id="sfc"></a>
 
@@ -1197,3 +1173,11 @@ Two things follow from that. The more cores are reading, the slower the write la
 ### Abandoning Onload: Onload takes 1,090 ns per call, and costs 23 μs more at p99.9
 
 Onload holds the TCP state while I push the order frame myself with ef_vi. But after every send I must tell Onload what went out: 1,090 ns at p50, 61,593 ns at p99.9. It is spent after the card has been rung. If the next ef_eventq_poll finds nothing, it costs nothing, since that time was idle anyway. If it does find events, they waited through it, so it hits the tail. My own TCP has no such call.
+
+<a id="fpga"></a>
+
+### FPGA vs CPU: the order is in the FPGA before the tick
+
+One FPGA clock cycle is 4 ns, while a CPU cycle can be 0.2 ns, but the FPGA does far more in one of them. Under kernel bypass, one round trip between an HFT NIC and the CPU is about 0.5–2 μs, which is what kernel bypass pays and an FPGA does not.
+
+Before the tick the CPU builds the order bytes and the condition that fires them, and writes both into the FPGA. The condition is one comparison, a price crossing a level. On the tick the FPGA compares and sends bytes it already holds. The condition is only right for the book the CPU last saw, so the cost is rewriting it as the book moves.
