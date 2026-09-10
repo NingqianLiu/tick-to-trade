@@ -201,7 +201,7 @@ What v11 did:
 **1. Where the latency goes**
 
 - [Measure the latency gap versus competitors, not my average](#delta)
-- [FPGA vs CPU past ~300 serial cycles](#fpga)
+- [FPGA vs CPU: the order is in the FPGA before the tick](#fpga)
 
 **2. Inside the core**
 
@@ -272,17 +272,17 @@ What v11 did:
 
 ### Measure the latency gap versus competitors, not my average
 
-Low-latency work needs more than my own latency at each point in time. It needs the gap between when I get the data and when my competitor gets it. So I also want latency measured on a second colo box.
+Low-latency work needs more than my own latency at each point in time. It needs the gap between when I get the data and when my competitor gets it.
 
-If the standard deviation of that gap is 500 ns, then every 50 ns I cut off wire-to-wire buys some win rate.
+Two numbers from my own trades show that gap: my win rate when several of us go for one price in the same microsecond, and whether my resting order is pulled in time when the market moves.
 
 <a id="fpga"></a>
 
-### FPGA vs CPU past ~300 serial cycles
+### FPGA vs CPU: the order is in the FPGA before the tick
 
-An FPGA is a bad fit for a strategy with a long dependency chain. One FPGA clock cycle is 4 ns, while a CPU cycle can be 0.2 ns. Under kernel bypass, one round trip between an HFT NIC and the CPU (not counting CPU compute) is about 1–1.5 μs — that is what the FPGA saves you.
+One FPGA clock cycle is 4 ns, while a CPU cycle can be 0.2 ns, but the FPGA does far more in one of them. Under kernel bypass, one round trip between an HFT NIC and the CPU is about 0.5–2 μs, which is what kernel bypass pays and an FPGA does not.
 
-So once the FPGA's serial chain is deeper than about 300 clock cycles, it is not worth using any more. FPGA development is also slow.
+Before the tick the CPU builds the order bytes and the condition that fires them, and writes both into the FPGA. The condition is one comparison, a price crossing a level. On the tick the FPGA compares and sends bytes it already holds. The condition is only right for the book the CPU last saw, so the cost is rewriting it as the book moves.
 
 ---
 
