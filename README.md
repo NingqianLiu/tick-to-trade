@@ -258,6 +258,7 @@ What v11 did:
 - [CTPIO cut-through](#sfc)
 - [More spinning cores make the NIC write land later](#dma)
 - [Abandoning Onload: Onload takes 1,090 ns per call, and costs 23 μs more at p99.9](#mintcp) ⭐
+- [NIC heat: the card lowers its clock near the limit](#heat)
 - [FPGA vs CPU: the order is in the FPGA before the tick](#fpga)
 
 ---
@@ -1173,6 +1174,12 @@ Two things follow from that. The more cores are reading, the slower the write la
 ### Abandoning Onload: Onload takes 1,090 ns per call, and costs 23 μs more at p99.9
 
 Onload holds the TCP state while I push the order frame myself with ef_vi. But after every send I must tell Onload what went out: 1,090 ns at p50, 61,593 ns at p99.9. It is spent after the card has been rung. If the next ef_eventq_poll finds nothing, it costs nothing, since that time was idle anyway. If it does find events, they waited through it, so it hits the tail. My own TCP has no such call.
+
+<a id="heat"></a>
+
+### NIC heat: the card lowers its clock near the limit
+
+Solarflare NICs run hot, and they are not good at getting rid of that heat. The SFN8522, the X2522 and the X4522 are all like this. So they need extra cooling, and their temperature needs watching. When the card gets near its heat limit, it lowers its clock speed, and that makes the tail latency shoot up.
 
 <a id="fpga"></a>
 
