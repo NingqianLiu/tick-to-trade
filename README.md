@@ -215,6 +215,7 @@ What v11 did:
 - [fetch_add on double is not wait-free](#atomic-trap)
 - [Spurious CAS failure comes from LL/SC, not from x86](#weak)
 - [Store buffer makes the SPSC snapshot to shm nearly free](#storebuf) ⭐
+- [False sharing on Intel: alignas(128), not alignas(64)](#false-sharing)
 
 **3. Memory ordering**
 
@@ -589,6 +590,12 @@ Why it stays free:
 > **A:** No. The store buffer holds the *value*, not a pointer — the bytes are copied into the store buffer entry the moment the STD uop runs. Whatever the portfolio does after that has nothing to do with this store. The hardware does not need to copy anything extra.
 
 Related: if another core's work depends on this store buffer write — SPSC is exactly that case — a `prefetchw` (prefetch with write intent) sends the LFB/MSHR request earlier, so the store buffer can finish sooner.
+
+<a id="false-sharing"></a>
+
+### False sharing on Intel: alignas(128), not alignas(64)
+
+On Intel, when a core misses on a 64 B line, the L2 adjacent-line prefetcher also pulls in the other 64 B line of the same aligned 128 B block. It only reads that line. But if another core is writing it, that core's copy becomes shared, and its next write needs an RFO to invalidate the prefetched copy. `alignas(128)` keeps two hot fields out of the same block.
 
 ---
 
