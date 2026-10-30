@@ -1,3 +1,5 @@
+<p align="right"><b>English</b> | <a href="README.zh-CN.md">中文</a></p>
+
 # Wire-to-wire on this machine
 
 Wire-to-wire is the only number here: the Solarflare NIC stamps the first byte of the
@@ -62,12 +64,14 @@ those numbers are exact.
 
 One technique per branch, measured against the version before it, the two run in turn.
 
+The one that mattered most is [v9](#v9).
+
 ![v1 to v2](charts/v1_v2.svg)
 
 What v2 did (no code changed):
 
 1) Kept other work off the reserved cores. An ssh tunnel woke on one every ninety seconds.
-2) isolcpus stops the scheduler putting work on a core. It does not stop anyone else.
+2) isolcpus stops the scheduler moving work onto a core. A task allowed to run there can still land on it, and then the scheduler never moves it off.
 3) Stopped reading UEFI variables during a run — one read freezes both sockets for 1.13 ms.
 4) After a freeze the replay catches up at full speed, so a millisecond arrives at once.
 
@@ -137,6 +141,8 @@ What v8 did:
 and at real speed the moments that make a tail hardly come round at all. Running the
 replay fifty times faster leans on the code hard enough that its weak spots show, and then
 the old and the new version can be told apart.**
+
+<a id="v9"></a>
 
 ![v8 to v9](charts/v8_v9.svg)
 
@@ -209,7 +215,6 @@ What v11 did:
 **2. Multicore: the real lock is the cacheline**
 
 - [RFO on every shared write: 10–300 ns](#rfo) ⭐
-- [atomic over volatile; mutex at cacheline level](#volatile)
 - [CAS retries grow as n(n+1)/2: switched to single-writer](#cas)
 - [lock-free vs wait-free](#lockfree) ⭐
 - [fetch_add on double is not wait-free](#atomic-trap)
@@ -432,16 +437,6 @@ Typical Intel Xeon Scalable estimates:
 3. If the line is not in my L1 at all, I have to invalidate the other cores' copies *and* fetch the 64 B. This is slower than case 2. The returning data sits in an LFB/MSHR, and the 64 B comes back together with the ownership, through the Owned holder or L3.
 
 One more: I am on socket 0 and I do not know whether socket 1 has a copy. I have to check, or socket 1 could keep using stale data. But I do not check with socket 1 — I check with the home node's directory. If home is on my socket that is much faster. If home is on the other socket it is slow, as slow as an RFO going to a remote socket.
-
-<a id="volatile"></a>
-
-### atomic over volatile; mutex at cacheline level
-
-1. This model is still not complete. A value already loaded into a register cannot be invalidated. You need an atomic to read the data layer by layer from L1, L2, L3 and RAM (same priority as a normal read).
-2. `volatile` re-reads from cache and RAM, and `atomic` does that too. `atomic` also fits better on the consistency side, so use `atomic`.
-3. `volatile` is mainly for hardware memory — cases where something is written to RAM and the CPU does not know about it.
-4. So I can think of a mutex as a 0/1 inside a 64 B line. Another core takes the cache line, sees it is already held by me, and has to give up. That is how the lock works.
-5. While `lock add [mem]` runs, the cache line is locked. It only becomes free for other cores to invalidate after the instruction retires. The line sits in that core's L1 in M state, locked for about 10–20 cycles.
 
 <a id="cas"></a>
 
