@@ -166,9 +166,13 @@ What v10 did: ⭐
 
 ---
 
-**From here the replay runs at wire speed: blast drops the pacing, and one NIC port carries
-the A feed and the B feed together at 8 to 8.3 Gb/s. Live trading gives each feed its own
-link.**
+**After ten versions of optimization the latency is low enough for one last test: replay the
+market as fast as this card can send it, so every moment from start to end is a burst. Blast
+mode drops the pacing, and one NIC port carries the A feed and the B feed together at 8 to
+8.3 Gb/s. Live trading gives each feed its own link, and the market only reaches wire speed
+in short bursts; here it never stops, so the code has to keep up with 8 Gb/s of input without
+a break. That is the most pressure I put on it. If the tail stays steady here, I treat tail
+latency as solved.**
 
 ![v10 to v11](charts/v10_v11.svg)
 
