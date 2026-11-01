@@ -64,7 +64,7 @@ those numbers are exact.
 
 One technique per branch, measured against the version before it, the two run in turn.
 
-[The one that mattered most is v9](#what-v9-did)
+[The most interesting optimization is v9](#what-v9-did)
 
 The matching low-latency note:
 
@@ -152,9 +152,56 @@ the old and the new version can be told apart.**
 
 ![v8 to v9](charts/v8_v9.svg)
 
-1) I no longer finish one order and then go handle the next order; instead I group a batch of
-   orders by type, then walk this batch of orders seven times.
-2) The seven passes go in this order:
+1. As of v9, the data structures of each stock (for example AAPL):
+
+```
+Level        one 4B sum_qty per price level, "number of price levels" of them:
+             number of price levels = the ticks between yesterday's close / 8 and
+             yesterday's close × 8
+             important: Level does not store which orders sit at each price level,
+             because NASDAQ gives me orders that have been filled, not an order that I
+             have to match against the other side, so I do not need to run a matching
+             engine
+
+PoolMap      the only structure that stores orders; like unordered_map, but
+               1) at startup it allocates a Node array of several GB (tens of GB or even
+                  more also work) of contiguous addresses up front, on huge pages and
+                  touched, so running short at run time is not a concern,
+               2) the pool adds last in, first out for nodes, because a node just freed
+                  is very likely still in cache,
+               3) use base (the start address of the preallocation) + next (4B) to
+                  compute the address of the next node
+             oid -> Node 24B: { uint64_t oid; uint32_t shares; uint32_t price;
+                                uint32_t next; uint16_t sym; uint8_t side; }
+             on a cancel or a fill, the oid leads straight to the order: change its
+             shares, then change sum_qty in Level
+
+PriceBitmap  lets the strategy look up the prices of bid 1 2 3 and offer 1 2 3, then
+             get sum_qty from Level; it is made of a bitmap of 3 layers of uint64_t,
+             each bit of layer 1 says whether this price level has orders, and each bit
+             of layer 2 says whether one particular uint64_t in layer 1 is != 0:
+               layer 1 memory = number of price levels / 64¹ × 8 B
+               layer 2 memory = number of price levels / 64² × 8 B
+               layer 3 memory = number of price levels / 64³ × 8 B
+             mask with the bitmask, then __builtin_clzll, and a few cycles find the
+             next price level with resting orders
+             compared with a list: for consecutive lookups, one uint64_t covers 64 price
+             levels, and price levels near the top of the book mostly have orders next
+             to each other, so it performs better than a list
+```
+
+2. I no longer finish one order and then go handle the next order; instead I group a batch of
+   orders by type, then process the grouped orders with batch processing.
+
+First I go over every packet fetched in this batch and every order in each packet, and put
+them by type into 4 arrays (each entry is which message in this batch it is):
+
+```
+uint32_t bucket_add[kMaxHits];    // A, F
+uint32_t bucket_repl[kMaxHits];   // U
+uint32_t bucket_del[kMaxHits];    // D
+uint32_t bucket_cut[kMaxHits];    // E, C, X
+```
 
 ```
 A = Add
@@ -165,58 +212,63 @@ E = Executed
 C = Executed with price
 X = Cancel
 
-pass 1  A/F    a new order comes in
-pass 2  U2     build the order under the Update order's new order id, leave the
-               order's side (not known yet at this point) empty for now, note the
-               address of the side
-pass 3  U1     look up the old order id, note where it is, change nothing
-pass 4  U2     in the order of the Update orders, copy the old order's side to the new
-               order (only this pass has to go in order)
-pass 5  U1     delete the Update's old order (U1) from the book
-pass 6  D      cancel the whole order
-pass 7  E/C/X  partly filled, cut the qty, if the order is not found, ignore it,
-               saving computation, this case means the order was cancelled when this
-               batch of orders ended
+pass 1  A/F    each order in bucket_add: build the new order in PoolMap by oid
+               (no matter where it sits in this batch, even if U or X come before it)
+pass 2  U2     each order in bucket_repl: build the new order with new_oid (U2), put
+               it in PoolMap, leave the order's side (not known yet) empty for now, note
+               the address of new_oid's side
+pass 3  U1     each order in bucket_repl: look up the order for old_oid in the
+               hashmap, note the address of its side, change nothing
+pass 4  U2     each order in bucket_repl: in order, copy the old order's side to the
+               new order (only this pass has to go in order)
+pass 5  U1     each order in bucket_repl: with old_oid (U1), delete the old order
+               from PoolMap
+pass 6  D      each order in bucket_del: cancel the whole order in PoolMap by oid
+pass 7  E/C/X  each order in bucket_cut: cut the qty; skip it if it is not found,
+               saving work (not found means this order ends up cancelled by a D in this
+               batch, or replaced by a U)
 ```
 
 The difficulty I ran into: the problem with U is that U does not carry a side, and the new
 order's side has to be fetched from the old order by a table lookup. But the new order's U2
-(add) has to be handled first, and at this point U1 (delete) has not run yet, so the side of
-U1 (the old order) is not known yet.
+(add) has to run first, while U1 (delete) has not run yet, so the side of U1 (the old order)
+is not known yet; so when U2 (add) runs first, its side is left empty.
 
 ```
-The order book finds orders by oid with a hashmap: key=oid, value=the order's address
+APPL's book before this batch:  { 0123: Node }    <- from an earlier batch, side=buy
 
-APPL's book before this batch:  { 0123: address }    <- from an earlier batch, side=buy
+The three U in this batch; U does not carry a side:
+U: APPL  old_oid 0123 -> new_oid 1234
+U: APPL  old_oid 1234 -> new_oid 2345    <- 1234 was just built by the U before it
+U: APPL  old_oid 2345 -> new_oid 3456    <- 3456 is the order that survives this batch
 
-The three U in this batch, none of them carries a side:
-U:APPL  old_oid 0123 -> new_oid 1234
-U:APPL  old_oid 1234 -> new_oid 2345    <- 1234 was just built by the U before it
-U:APPL  old_oid 2345 -> new_oid 3456    <- 3456 is the order that survives this batch
-
-APPL's book after this batch:   { 3456: address }    <- side=buy, passed down from 0123
+APPL's book after this batch:   { 3456: Node }    <- side=buy, passed down from 0123
 ```
 
 Another difficulty I ran into: as in the example above, within one batch the U messages often
 link into a chain (the old order of this U is exactly the new order the U before it just
 built), so if U1 (delete) is done first, it finds that the order id does not exist. For
 example, if U1 of the second U (delete APPL old_oid 1234) runs first, it finds that oid 1234
-is not in APPL's order book yet — it only gets built by U2 (add) of the first U.
+is not in PoolMap yet — it only gets built by U2 (add) of the first U.
 
-So in `pass 4`, when copying to the new orders. If the copying goes in order, it turns out
-that the side just copied to oid 1234 is right away copied again to the side of oid 2345,
-which is right. If the copying does not go in order, it turns out that if copying the side of
-oid 1234 to oid 2345 runs first, the side of oid 1234 is still unknow, which does not work.
+So U2 (add) has to be done first and U1 (delete) after it: U2 leaves the side empty, and
+after U1's table lookup is done, U2's side is filled in, and then U1 is deleted
 
-3) Q: What is the purpose of adopting this design? A: This design lets me execute the order
-   updates the exchange sends out of order (except for pass 4, within each pass no order
-   depends on any other), and so process orders of the same kind in batches, in parallel (the
-   processing logic is the same, so the code is the same, for example processing 16 order
-   cancels at the same time), turning the order stream A D A D A D into the order stream A A
-   A D D D, and because the code logic is the same and the orders are independent of each
-   other, I can, by splitting the loops, turn on the MLP technique, compressing the latency
-   of 4-12 cache misses into the latency of 1 cache miss, and so largely hiding the latency
-   of cache misses. [measured](#mlp-measured)
+By this point the book is fully updated, and the result is the same as updating the orders
+one by one in packet order and in the order of the orders inside each packet.
+
+3. Q: What is the purpose of adopting this design?
+
+   A: This design lets me execute the order updates the exchange sends out of order (except
+   for `pass 4`, within each pass no order depends on any other), and so process orders of
+   the same kind in batches, in parallel (the processing logic is the same, so the code is
+   the same, for example processing 16 order cancels at the same time), turning the order
+   stream A D A D A D into the order stream A A A D D D, and because the code logic is the
+   same and the orders are independent of each other, I can, by splitting the loops, turn on
+   the MLP technique, compressing the latency of 4-12 cache misses into the latency of 1
+   cache miss, and so largely hiding the latency of cache misses. [measured](#mlp-measured)
+
+---
 
 What v10 did: ⭐
 
