@@ -6,7 +6,7 @@ Wire-to-wire is the only number here: the Solarflare NIC stamps the first byte o
 market data frame coming in and the first byte of the order going out, and everything
 between is mine.
 
-On a current CPU with DDIO at 5 GHz or more, a Solarflare X4522 NIC, PCIe and the bare
+On a latest-generation CPU with DDIO at 5 GHz or more, a Solarflare X4522 NIC, PCIe and the bare
 ef_vi receive and send path cost about 575 ns. The 620 ns work segment here runs on my old
 CPU at 3.31 GHz and carries the DRAM read latency; on that machine it should come down to
 about 400 ns. With the latest hardware I think a wire-to-wire p50 < 1 μs is reachable.

@@ -4,7 +4,7 @@
 
 这里唯一的数字就是 wire-to-wire: Solarflare 网卡给进来的行情 frame 的第一个字节、和出去的订单的第一个字节各打一个时间戳, 两个时间戳之间的一切都算我的。
 
-在一颗带 DDIO、主频 5 GHz 或更高的当代 CPU 上, Solarflare X4522 网卡、PCIe 和裸的 ef_vi 收发路径加起来大约 575 ns。这里 620 ns 的 work 段是在我 3.31 GHz 的旧 CPU 上跑的, 里面还背着 DRAM 读延迟; 换到那样的机器上, 它应该能降到 400 ns 左右。用最新的硬件, 我认为 wire-to-wire p50 < 1 μs 是做得到的。
+在一颗带 DDIO、主频 5 GHz 或更高的最新一代 CPU 上, Solarflare X4522 网卡、PCIe 和裸的 ef_vi 收发路径加起来大约 575 ns。这里 620 ns 的 work 段是在我 3.31 GHz 的旧 CPU 上跑的, 里面还背着 DRAM 读延迟; 换到那样的机器上, 它应该能降到 400 ns 左右。用最新的硬件, 我认为 wire-to-wire p50 < 1 μs 是做得到的。
 
 我的是一台 7 年前的 AMD, 3.31 GHz, 没有 DDIO, 所以包落进内存而不是 L3; 一个核只够得着 16 MB 的 L3, 而订单簿要大得多, 所以一次查找要在 DRAM 上等 120 ns。网卡是一张 10 年前的 SFN8522-PLUS, 没有 CTPIO, 所以它要把整个 frame 都收进来之后, 才会往外发出任何一部分。
 
