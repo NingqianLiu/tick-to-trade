@@ -64,7 +64,7 @@ those numbers are exact.
 
 One technique per branch, measured against the version before it, the two run in turn.
 
-[The one that mattered most is v9](#v9)
+[The one that mattered most is v9](#what-v9-did)
 
 The matching low-latency note:
 
@@ -146,7 +146,7 @@ and at real speed the moments that make a tail hardly come round at all. Running
 replay fifty times faster leans on the code hard enough that its weak spots show, and then
 the old and the new version can be told apart.**
 
-<a id="v9"></a>
+<a id="what-v9-did"></a>
 
 ![v8 to v9](charts/v8_v9.svg)
 
@@ -394,7 +394,7 @@ does not wait for the previous result), and M has room for 8 (8 is below Zen 2's
 and the loop is short enough that all 8 lookups sit in the out-of-order window at once).
 
 Measured on this machine: 8 independent accesses that each go to DRAM take about 1,002 ns one
-after another (about 125 ns each), and about 136 ns sent together. ⭐
+after another (about 125 ns each), and about 136 ns sent together. ⭐⭐⭐
 
 ```
 LFB   miss tracking slots. Any L1 miss takes one, and a DRAM read holds it ten
