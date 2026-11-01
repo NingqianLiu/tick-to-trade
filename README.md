@@ -373,6 +373,29 @@ cost per miss = miss latency / M
 
 `M` is the in-flight MLP number, and I want it bigger. Once it reaches `LFB` there is no room left.
 
+For example, 8 independent lookups in a hashmap (8 different order ids), each missing once:
+
+```
+lookup 1   misses L3 too, goes to DRAM   110 ns
+lookup 2   misses L3 too, goes to DRAM   120 ns
+lookup 3   misses L2, hits L3             12 ns   (39 cycles at 3.31 GHz)
+lookup 4   misses L3 too, goes to DRAM   125 ns
+lookup 5   misses L3 too, goes to DRAM   130 ns
+lookup 6   misses L3 too, goes to DRAM   115 ns
+lookup 7   misses L2, hits L3             12 ns
+lookup 8   misses L3 too, goes to DRAM   120 ns
+
+without MLP   one after another   110 + 120 + 12 + 125 + 130 + 115 + 12 + 120 = 744 ns
+with MLP      all 8 at once       ≈ max(110, 120, 12, 125, 130, 115, 12, 120) = 130 ns
+```
+
+Getting 130 ns needs two things: the 8 lookups do not depend on each other (the next address
+does not wait for the previous result), and M has room for 8 (8 is below Zen 2's 22 MSHRs,
+and the loop is short enough that all 8 lookups sit in the out-of-order window at once).
+
+Measured on this machine: 8 independent DRAM accesses take about 1,002 ns one after another,
+and about 136 ns sent together. ⭐
+
 ```
 LFB   miss tracking slots. Any L1 miss takes one, and a DRAM read holds it ten
       times longer than an L3 hit, so DRAM is what runs them out.
