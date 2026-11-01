@@ -70,18 +70,18 @@ The matching low-latency note:
 
 [MLP in flight = min(LFB, window/L, work on hand)](#mlp)
 
-![v1 to v2](charts/v1_v2.svg)
-
 What v2 did (no code changed):
+
+![v1 to v2](charts/v1_v2.svg)
 
 1) Kept other work off the reserved cores. An ssh tunnel woke on one every ninety seconds.
 2) isolcpus stops the scheduler moving work onto a core. A task allowed to run there can still land on it, and then the scheduler never moves it off.
 3) Stopped reading UEFI variables during a run — one read freezes both sockets for 1.13 ms.
 4) After a freeze the replay catches up at full speed, so a millisecond arrives at once.
 
-![v2 to v3](charts/v2_v3.svg)
-
 What v3 did:
+
+![v2 to v3](charts/v2_v3.svg)
 
 1) Books only for the Nasdaq-100. The whole feed still comes in; Nasdaq sends one stream.
 2) One core does the whole job, where before it took a poller and three shards.
@@ -93,26 +93,26 @@ Do not read too much into the latency here — the two sides no longer carry the
 The Nasdaq-100 is about 11% of the market's messages, and one core carries that where
 three used to carry everything.
 
-![v3 to v4](charts/v3_v4.svg)
-
 What v4 did:
+
+![v3 to v4](charts/v3_v4.svg)
 
 1) Several orders now share one message, sent when it fills or when the poll ends.
 2) Sending one costs 870 ns, and 810 of that is per message, not per order.
 3) So a poll that fired eighty orders used to pay it eighty times.
 4) It costs 90 ns at the median: the first order waits for the rest.
 
-![v4 to v5](charts/v4_v5.svg)
-
 What v5 did:
+
+![v4 to v5](charts/v4_v5.svg)
 
 1) The order path is my own TCP now: 110 ns, against 1,540 through the stack.
 2) 1,090 of that 1,540 was one call, and it runs after the card has been rung.
 3) So it never held up its own order, only the ones behind it — a tail cost, not a median one.
 
-![v5 to v6](charts/v5_v6.svg)
-
 What v6 did:
+
+![v5 to v6](charts/v5_v6.svg)
 
 1) Time stamps at five points, so wire-to-wire breaks into four segments.
 2) That showed the wait before I see a packet is my own doing — I am still busy with the
@@ -121,18 +121,18 @@ What v6 did:
 4) A record, not a result: the machine changed here too, not only the code.
 5) The path did not change here. The numbers are a little worse only because I added rdtsc and lfence to measure it.
 
-![v6 to v7](charts/v6_v7.svg)
-
 What v7 did:
+
+![v6 to v7](charts/v6_v7.svg)
 
 1) The exchange's replies get their own receive queue, out from behind the market data.
 2) And their own thread — one thread on both queues is still stuck in the same batch.
 3) Over the closing ten minutes at full speed, 9,485 refused orders became 0.
 4) The median does not move: reading the reply on another core costs about 89 ns.
 
-![v7 to v8](charts/v7_v8.svg)
-
 What v8 did:
+
+![v7 to v8](charts/v7_v8.svg)
 
 1) The signal is judged once per poll, not once per message.
 2) One poll can carry hundreds of messages for the same name.
@@ -148,9 +148,9 @@ the old and the new version can be told apart.**
 
 <a id="v9"></a><a id="what-v9-did"></a>
 
-![v8 to v9](charts/v8_v9.svg)
-
 **What v9 did: ⭐**
+
+![v8 to v9](charts/v8_v9.svg)
 
 1) I no longer finish one order and then go handle the next order; instead I group a batch of
    orders by type, then walk this batch of orders seven times.
@@ -184,33 +184,43 @@ order's side has to be fetched from the old order by a table lookup. But the new
 (add) has to be handled first, and at this point U1 (delete) has not run yet, so the side of
 U1 (the old order) is not known yet.
 
-Another difficulty I ran into: within one batch the U messages often link into a chain (the
-old order of this U is exactly the new order the U before it just built), so if U1 (delete)
-is done first, it finds that the order id does not exist.
 ```
-U:APPL old_oid 0123, side unknown, new_oid 1234 <- old_oid is an order from an earlier
-                                                   batch, side=buy
-U:APPL old_oid 1234, side unknown, new_oid 2345
-U:APPL old_oid 2345, side unknown, new_oid 3456 -> new_oid is the order that survives at
-                                                   the end of this batch
+The order book finds orders by oid with a hashmap: key=oid, value=the order's address
+
+APPL's book before this batch:  { 0123: address }    <- from an earlier batch, side=buy
+
+The three U in this batch, none of them carries a side:
+U:APPL  old_oid 0123 -> new_oid 1234
+U:APPL  old_oid 1234 -> new_oid 2345    <- 1234 was just built by the U before it
+U:APPL  old_oid 2345 -> new_oid 3456    <- 3456 is the order that survives this batch
+
+APPL's book after this batch:   { 3456: address }    <- side=buy, passed down from 0123
 ```
 
-So in `pass 4`, when copying to the new orders. If the copying goes in order, it turns out that
-the side just copied to oid 1234 is right away copied again to the side of oid 2345. If the
-copying does not go in order, it turns out that if copying the side to oid 2345 runs first,
-the side of oid 1234 is still unknow
+Another difficulty I ran into: as in the example above, within one batch the U messages often
+link into a chain (the old order of this U is exactly the new order the U before it just
+built), so if U1 (delete) is done first, it finds that the order id does not exist. For
+example, if U1 of the second U (delete APPL old_oid 1234) runs first, it finds that oid 1234
+is not in APPL's order book yet — it only gets built by U2 (add) of the first U.
+
+So in `pass 4`, when copying to the new orders. If the copying goes in order, it turns out
+that the side just copied to oid 1234 is right away copied again to the side of oid 2345,
+which is right. If the copying does not go in order, it turns out that if copying the side to
+oid 2345 runs first, the side of oid 1234 is still unknow, which does not work.
 
 3) Q: What is the purpose of adopting this design? A: This design lets me execute the order
-   updates the exchange sends out of order, and so process orders of the same kind in
-   batches, in parallel (the processing logic is the same, so the code is the same, for
-   example processing 16 order cancels at the same time), turning the order stream A D A D A
-   D into the order stream A A A D D D, and the same code lets me, by splitting the loops,
-   turn on the MLP technique, compressing the latency of 4-12 cache misses into the latency
-   of 1 cache miss, and so largely hiding the latency of cache misses.
-
-![v9 to v10](charts/v9_v10.svg)
+   updates the exchange sends out of order (except for pass 4, within each pass no order
+   depends on any other), and so process orders of the same kind in batches, in parallel (the
+   processing logic is the same, so the code is the same, for example processing 16 order
+   cancels at the same time), turning the order stream A D A D A D into the order stream A A
+   A D D D, and because the code logic is the same and the orders are independent of each
+   other, I can, by splitting the loops, turn on the MLP technique, compressing the latency
+   of 4-12 cache misses into the latency of 1 cache miss, and so largely hiding the latency
+   of cache misses. [measured](#mlp-measured)
 
 What v10 did: ⭐
+
+![v9 to v10](charts/v9_v10.svg)
 
 1) By now there is not much left to take out except in parsing, so this pass is still the
    tool I like best: instruction and memory level parallelism, which means giving the CPU
@@ -229,9 +239,9 @@ in short bursts; here it never stops, so the code has to keep up with 8 Gb/s of 
 a break. That is the most pressure I put on it. If the tail stays steady here, I treat tail
 latency as solved.**
 
-![v10 to v11](charts/v10_v11.svg)
-
 What v11 did:
+
+![v10 to v11](charts/v10_v11.svg)
 
 1) I used ILP and MLP again, this time after diagnosing the code.
 2) It only makes the tail better, and p50 comes out slightly worse. p50 is 5.5 to 6 μs
@@ -393,7 +403,7 @@ Getting 130 ns needs two things: the 8 lookups do not depend on each other (the 
 does not wait for the previous result), and M has room for 8 (8 is below Zen 2's 22 MSHRs,
 and the loop is short enough that all 8 lookups sit in the out-of-order window at once).
 
-⭐⭐⭐ Measured on this machine: 8 independent accesses that each go to DRAM take about 1,002 ns one
+<a id="mlp-measured"></a>⭐⭐⭐ Measured on this machine: 8 independent accesses that each go to DRAM take about 1,002 ns one
 after another (about 125 ns each), and about 136 ns sent together. ⭐⭐⭐
 
 ```
