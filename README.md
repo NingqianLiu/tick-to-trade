@@ -205,8 +205,8 @@ is not in APPL's order book yet — it only gets built by U2 (add) of the first 
 
 So in `pass 4`, when copying to the new orders. If the copying goes in order, it turns out
 that the side just copied to oid 1234 is right away copied again to the side of oid 2345,
-which is right. If the copying does not go in order, it turns out that if copying the side to
-oid 2345 runs first, the side of oid 1234 is still unknow, which does not work.
+which is right. If the copying does not go in order, it turns out that if copying the side of
+oid 1234 to oid 2345 runs first, the side of oid 1234 is still unknow, which does not work.
 
 3) Q: What is the purpose of adopting this design? A: This design lets me execute the order
    updates the exchange sends out of order (except for pass 4, within each pass no order
