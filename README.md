@@ -146,7 +146,7 @@ and at real speed the moments that make a tail hardly come round at all. Running
 replay fifty times faster leans on the code hard enough that its weak spots show, and then
 the old and the new version can be told apart.**
 
-<a id="what-v9-did"></a>
+<a id="v9"></a><a id="what-v9-did"></a>
 
 ![v8 to v9](charts/v8_v9.svg)
 
