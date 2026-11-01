@@ -265,8 +265,9 @@ one by one in packet order and in the order of the orders inside each packet.
    the same, for example processing 16 order cancels at the same time), turning the order
    stream A D A D A D into the order stream A A A D D D, and because the code logic is the
    same and the orders are independent of each other, I can, by splitting the loops, turn on
-   the MLP technique, compressing the latency of 4-12 cache misses into the latency of 1
-   cache miss, and so largely hiding the latency of cache misses. [measured](#mlp-measured)
+   the MLP technique, in the PoolMap lookups, compressing the latency of 8 cache line misses
+   into the latency of 1 cache line miss, and so greatly cutting the total latency of cache
+   line misses within one batch. [measured](#mlp-measured)
 
 ---
 
