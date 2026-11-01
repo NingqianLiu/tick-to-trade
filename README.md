@@ -64,7 +64,11 @@ those numbers are exact.
 
 One technique per branch, measured against the version before it, the two run in turn.
 
-The one that mattered most is [v9](#v9).
+[The one that mattered most is v9](#v9)
+
+The matching low-latency note:
+
+[MLP in flight = min(LFB, window/L, work on hand)](#mlp)
 
 ![v1 to v2](charts/v1_v2.svg)
 
@@ -146,12 +150,63 @@ the old and the new version can be told apart.**
 
 ![v8 to v9](charts/v8_v9.svg)
 
-What v9 did: ⭐
+**What v9 did: ⭐**
 
-1) Instead of finishing one message before moving to the next, I group a batch by type and
-   walk it seven times.
-2) Each lookup in a pass is for a different order, so the CPU waits for all of them at
-   once. That is MLP.
+1) I no longer finish one order and then go handle the next order; instead I group a batch of
+   orders by type, then walk this batch of orders seven times.
+2) The seven passes go in this order:
+
+```
+A = Add
+F = Add with MPID
+U = Replace = U1 (Delete) + U2 (Add)
+D = Delete
+E = Executed
+C = Executed with price
+X = Cancel
+
+pass 1  A/F    a new order comes in
+pass 2  U2     build the order under the Update order's new order id, leave the
+               order's side (not known yet at this point) empty for now, note the
+               address of the side
+pass 3  U1     look up the old order id, note where it is, change nothing
+pass 4  U2     in the order of the Update orders, copy the old order's side to the new
+               order (only this pass has to go in order)
+pass 5  U1     delete the Update's old order (U1) from the book
+pass 6  D      cancel the whole order
+pass 7  E/C/X  partly filled, cut the qty, if the order is not found, ignore it,
+               saving computation, this case means the order was cancelled when this
+               batch of orders ended
+```
+
+The difficulty I ran into: the problem with U is that U does not carry a side, and the new
+order's side has to be fetched from the old order by a table lookup. But the new order's U2
+(add) has to be handled first, and at this point U1 (delete) has not run yet, so the side of
+U1 (the old order) is not known yet.
+
+Another difficulty I ran into: within one batch the U messages often link into a chain (the
+old order of this U is exactly the new order the U before it just built), so if U1 (delete)
+is done first, it finds that the order id does not exist.
+```
+U:APPL old_oid 0123, side unknown, new_oid 1234 <- old_oid is an order from an earlier
+                                                   batch, side=buy
+U:APPL old_oid 1234, side unknown, new_oid 2345
+U:APPL old_oid 2345, side unknown, new_oid 3456 -> new_oid is the order that survives at
+                                                   the end of this batch
+```
+
+So in `pass 4`, when copying to the new orders. If the copying goes in order, it turns out that
+the side just copied to oid 1234 is right away copied again to the side of oid 2345. If the
+copying does not go in order, it turns out that if copying the side to oid 2345 runs first,
+the side of oid 1234 is still unknow
+
+3) Q: What is the purpose of adopting this design? A: This design lets me execute the order
+   updates the exchange sends out of order, and so process orders of the same kind in
+   batches, in parallel (the processing logic is the same, so the code is the same, for
+   example processing 16 order cancels at the same time), turning the order stream A D A D A
+   D into the order stream A A A D D D, and the same code lets me, by splitting the loops,
+   turn on the MLP technique, compressing the latency of 4-12 cache misses into the latency
+   of 1 cache miss, and so largely hiding the latency of cache misses.
 
 ![v9 to v10](charts/v9_v10.svg)
 
@@ -333,17 +388,19 @@ W     the out-of-order window, counted in instructions, roughly 120-240.
 L     instructions in the loop body / how many of them really miss cache
 ```
 
-Published sizes for the newest cores, for a sense of scale:
+The scale of the latest AMD / Intel architectures, and of the Zen 2 in this project:
 
-| | AMD Zen 5 | Intel Lion Cove |
-| --- | ---: | ---: |
-| ROB | 448 | 576 |
-| integer PRF | 240 | not published |
-| load queue | 202 | 80 |
-| store queue | 104 | 58 |
-| L1 miss tracking | 124 | 24, plus 80 L2 miss queues |
+| | AMD Zen 2 (this project) | AMD Zen 5 | Intel Lion Cove |
+| --- | ---: | ---: | ---: |
+| ROB | 224 | 448 | 576 |
+| integer PRF | 180 | 240 | not published, ~290 measured |
+| load queue | 44 | not published, ~202 measured | not published, ~189 measured |
+| store queue | 48 | 104 | 120 measured |
+| MSHR (Intel calls it LFB, AMD calls it MAB) | 22 | 124 | 24, plus 80 L2 miss queues |
 
-These are the sizes of the structures, not what a loop actually reaches.
+These are the sizes of the structures, not what a loop actually reaches. The cells marked
+measured are not published by the vendor; those numbers come from Chips and Cheese
+microbenchmarks.
 
 <a id="cmov"></a>
 
