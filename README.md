@@ -64,7 +64,7 @@ those numbers are exact.
 
 One technique per branch, measured against the version before it, the two run in turn.
 
-[The most interesting optimization is v9](#what-v9-did)
+[The most clever optimization is v9](#what-v9-did)
 
 The matching low-latency note:
 
@@ -173,7 +173,7 @@ PoolMap      the only structure that stores orders; like unordered_map, but
                   compute the address of the next node
              oid -> Node 24B: { uint64_t oid; uint32_t shares; uint32_t price;
                                 uint32_t next; uint16_t sym; uint8_t side; }
-             on a cancel or a fill, the oid leads straight to the order: change its
+             on a cancel or a fill, use the oid to find this order directly, change its
              shares, then change sum_qty in Level
 
 PriceBitmap  lets the strategy look up the prices of bid 1 2 3 and offer 1 2 3, then
@@ -235,14 +235,17 @@ order's side has to be fetched from the old order by a table lookup. But the new
 is not known yet; so when U2 (add) runs first, its side is left empty.
 
 ```
-APPL's book before this batch:  { 0123: Node }    <- from an earlier batch, side=buy
+APPL's book before this batch:  { 0123: Node }    <- 0123 is an order from the earlier
+                                                     batch, side=buy
 
 The three U in this batch; U does not carry a side:
 U: APPL  old_oid 0123 -> new_oid 1234
 U: APPL  old_oid 1234 -> new_oid 2345    <- 1234 was just built by the U before it
-U: APPL  old_oid 2345 -> new_oid 3456    <- 3456 is the order that survives this batch
+U: APPL  old_oid 2345 -> new_oid 3456    <- 3456 is the order that finally survives
+                                            this batch
 
-APPL's book after this batch:   { 3456: Node }    <- side=buy, passed down from 0123
+APPL's book after this batch:   { 3456: Node }    <- side=buy, passed all the way
+                                                     down from 0123
 ```
 
 Another difficulty I ran into: as in the example above, within one batch the U messages often
@@ -263,8 +266,9 @@ one by one in packet order and in the order of the orders inside each packet.
    for `pass 4`, within each pass no order depends on any other), and so process orders of
    the same kind in batches, in parallel (the processing logic is the same, so the code is
    the same, for example processing 16 order cancels at the same time), turning the order
-   stream A D A D A D into the order stream A A A D D D, and because the code logic is the
-   same and the orders are independent of each other, I can, by splitting the loops, turn on
+   stream A D U X A D U X into the order stream A A U2 U2 U1 U1 U2 U2 U1 U1 D D X X, and
+   because the code logic is the same and the orders are independent of each other, I can,
+   by splitting the loops, turn on
    the MLP technique, in the PoolMap lookups, compressing the latency of 8 cache line misses
    into the latency of 1 cache line miss, and so greatly cutting the total latency of cache
    line misses within one batch. [measured](#mlp-measured)
