@@ -393,7 +393,7 @@ Getting 130 ns needs two things: the 8 lookups do not depend on each other (the 
 does not wait for the previous result), and M has room for 8 (8 is below Zen 2's 22 MSHRs,
 and the loop is short enough that all 8 lookups sit in the out-of-order window at once).
 
-Measured on this machine: 8 independent accesses that each go to DRAM take about 1,002 ns one
+⭐⭐⭐ Measured on this machine: 8 independent accesses that each go to DRAM take about 1,002 ns one
 after another (about 125 ns each), and about 136 ns sent together. ⭐⭐⭐
 
 ```
