@@ -152,7 +152,7 @@ the old and the new version can be told apart.**
 
 ![v8 to v9](charts/v8_v9.svg)
 
-1. As of v9, the data structures of each stock (for example AAPL):
+1. Before v9, the data structures and the order processing logic of each stock (for example AAPL):
 
 ```
 Level        one 4B sum_qty per price level, "number of price levels" of them:
@@ -183,15 +183,29 @@ PriceBitmap  lets the strategy look up the prices of bid 1 2 3 and offer 1 2 3, 
                layer 1 memory = number of price levels / 64¹ × 8 B
                layer 2 memory = number of price levels / 64² × 8 B
                layer 3 memory = number of price levels / 64³ × 8 B
-             mask with the bitmask, then __builtin_clzll, and a few cycles find the
+             apply a bitmask, then __builtin_clzll, and a few cycles find the
              next price level with resting orders
              compared with a list: for consecutive lookups, one uint64_t covers 64 price
              levels, and price levels near the top of the book mostly have orders next
              to each other, so it performs better than a list
+
+On receiving an Add order:
+  1) build oid -> Node in PoolMap,
+  2) update the total order quantity at this price level in Level,
+  3) if needed, update PriceBitmap along with it
+On receiving a Delete order:
+  1) erase the oid in PoolMap,
+  2) update the total order quantity at this price level in Level,
+  3) if needed, update PriceBitmap along with it
+On receiving an Update order:
+  1) look up the old order in PoolMap and delete it,
+  2) build the new order's oid -> Node in PoolMap,
+  3) update the total order quantity at the new and old price levels in Level,
+  4) if needed, update PriceBitmap along with it
 ```
 
-2. I no longer finish one order and then go handle the next order; instead I group a batch of
-   orders by type, then process the grouped orders with batch processing.
+2. The v9 update: I no longer finish one order and then go handle the next order; instead I
+   group a batch of orders by type, then process the grouped orders with batch processing.
 
 First I go over every packet fetched in this batch and every order in each packet, and put
 them by type into 4 arrays (each entry is which message in this batch it is):
