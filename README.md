@@ -347,7 +347,7 @@ What v11 did:
 **1. Inside the core**
 
 - [ROB: out-of-order execution, in-order retire](#rob)
-- [Past ~22 loads the queue backs up, nothing is dropped](#prefetch)
+- [Past ~22 loads, a prefetch is dropped](#prefetch)
 - [MLP in flight = min(LFB, window/L, work on hand)](#mlp) ⭐
 - [if and ?: give the same asm; cmov is not free](#cmov)
 - [One store per cycle, 32 B wide, and not atomic](#store)
@@ -427,7 +427,7 @@ But functions like exp/log, which have long serial dependency chains once they a
 
 <a id="prefetch"></a>
 
-### Past ~22 loads the queue backs up, nothing is dropped
+### Past ~22 loads, a prefetch is dropped
 
 Once the CPU has more than about 22 loads outstanding, does it drop one or does it stall?
 
@@ -436,10 +436,11 @@ Two things have to be kept apart: a prefetch does not wait for its data, but it 
 ```
 prefetch goes out    takes a load queue slot, then asks for a slot to track that line
 a tracking slot free hands it over and the prefetch retires without the data   <- normal
-tracking slots full  it cannot retire, so it sits in the load queue and waits
+tracking slots full  the prefetch is dropped: it does not queue and is never sent
+a normal load        cannot be dropped, it waits in the load queue for a tracking slot
 ```
 
-So what happens is not a drop, it is back pressure. Once the load queue is full the front end cannot put any instruction in at all, so what stalls is not only memory — it is the whole pipeline.
+So what happens to a prefetch is a drop, not back pressure. The dropped prefetch does not block the load queue and the pipeline keeps going; the cost is that the line was not fetched early, and the real read of it later waits for the full memory latency.
 
 <a id="mlp"></a>
 
