@@ -42,20 +42,29 @@ stretch the link stays full for 857 μs on one feed, twice that with both.
 
 | | what it is | p50 ns | p90 ns | p99 ns | p99.9 ns | max ns |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `wait` | packet arrives, until we are told about it | 99 | 300 | 744 | 1,254 | 2,982 |
-| `fetch` | pick the packet up (issue the prefetch, do not wait on it) | 40 | 40 | 50 | 70 | 250 |
-| **`work` (3.31 GHz, DRAM read latency included)** | **all of `work 1` to `work 6`** | **620** | **890** | **1,360** | **1,930** | **3,050** |
-| `work 1: parse` | parse the ITCH messages and sort them | 180 | 320 | 470 | 730 | 1,960 |
-| `work 2: book` | apply them to the book in seven passes | 160 | 280 | 530 | 810 | 1,540 |
-| `work 3: signal` | check the signal | 90 | 120 | 380 | 790 | 1,720 |
-| `work 4: fields` | write the 5 fields of the order that change | 40 | 50 | 100 | 340 | 750 |
-| `work 5: header` | TCP header and the two checksums | 130 | 200 | 470 | 640 | 880 |
-| `work 6: doorbell` | ring the doorbell | 20 | 30 | 50 | 140 | 410 |
-| **`send`** | **handed to the card, until the bytes are on the wire** | **2,453** | **2,570** | **2,869** | **7,246** | **18,998** |
-| `total` | wire-to-wire, all of it | 3,248 | 3,636 | 4,232 | 4,873 | 7,294 |
+| `wait` (rdtsc - NIC timestamp, the time difference is not exact) | packet arrives, until we are told about it | 99 | 300 | 744 | 1,254 | 2,982 |
+| `fetch` (rdtsc - rdtsc, the time difference is exact) | pick the packet up (issue the prefetch, do not wait on it) | 40 | 40 | 50 | 70 | 250 |
+| **`work` (rdtsc - rdtsc, the time difference is exact) (3.31 GHz, DRAM read latency of the packet included)** | **all of `work 1` to `work 6`** | **620** | **890** | **1,360** | **1,930** | **3,050** |
+| `work 1: parse` (rdtsc - rdtsc, the time difference is exact) | parse the ITCH messages and sort them | 180 | 320 | 470 | 730 | 1,960 |
+| `work 2: book` (rdtsc - rdtsc, the time difference is exact) | apply them to the book in seven passes | 160 | 280 | 530 | 810 | 1,540 |
+| `work 3: signal` (rdtsc - rdtsc, the time difference is exact) | check the signal | 90 | 120 | 380 | 790 | 1,720 |
+| `work 4: fields` (rdtsc - rdtsc, the time difference is exact) | write the 5 fields of the order that change | 40 | 50 | 100 | 340 | 750 |
+| `work 5: header` (rdtsc - rdtsc, the time difference is exact) | TCP header and the two checksums | 130 | 200 | 470 | 640 | 880 |
+| `work 6: doorbell` (rdtsc - rdtsc, the time difference is exact) | ring the doorbell | 20 | 30 | 50 | 140 | 410 |
+| **`send` (NIC timestamp - rdtsc, the time difference is not exact)** | **handed to the card, until the bytes are on the wire** | **2,453** | **2,570** | **2,869** | **7,246** | **18,998** |
+| `total` (NIC timestamp - NIC timestamp, the time difference is exact) | wire-to-wire, all of it | 3,248 | 3,636 | 4,232 | 4,873 | 7,294 |
 
 `wait` and `send` are timed across two clocks, the card's and the CPU's, so they can come
-out too big — that is why `send` is above `total` at p99.9 and at the max.
+out too big or too small — that is why `send` is above `total` at p99.9 and at the max, and
+why `wait` p50 is below the DRAM access latency (120 ns).
+
+`wait` covers this path: the card takes in the whole frame and checks its CRC, writes it by
+DMA over PCIe into the CPU's IOdie (not through any physical core), and the IOdie writes it to a packet buffer in DRAM.
+Then the card writes one event for that packet into the event queue, also in DRAM. The CPU
+polls the event queue, and the read that sees the new event goes to DRAM. I measured one
+DRAM access at 120 ns. `wait` p50 is still only 99 ns, because the card's clock and the
+CPU's clock have an offset between them, and the two crystals run at slightly different
+speeds, so the offset keeps moving.
 
 `fetch`, `work`, `work 1` to `work 6` and `total` each start and end on one clock, so
 those numbers are exact.
@@ -280,9 +289,10 @@ one by one in packet order and in the order of the orders inside each packet.
    for `pass 4`, within each pass no order depends on any other), and so process orders of
    the same kind in batches, in parallel (the processing logic is the same, so the code is
    the same, for example processing 16 order cancels at the same time), turning the order
-   stream A D U X A D U X into the order stream A A U2 U2 U1 U1 U2 U2 U1 U1 D D X X, and
-   because the code logic is the same and the orders are independent of each other, I can,
-   by splitting the loops, turn on
+   stream that comes in the sequence A D U X A D U X A D U X into the order stream pass 1: A A A, pass 2: U2 U2 U2,
+   pass 3: U1 U1 U1, pass 4: U2 U2 U2, pass 5: U1 U1 U1, pass 6: D D D, pass 7: X X X
+   (every pass except pass 4 can run out of order), and because the code logic is the same and the orders are independent of each other, I can,
+   by splitting the loops plus out-of-order execution, turn on
    the MLP technique, in the PoolMap lookups, compressing the latency of 8 cache line misses
    into the latency of 1 cache line miss, and so greatly cutting the total latency of cache
    line misses within one batch. [measured](#mlp-measured)
