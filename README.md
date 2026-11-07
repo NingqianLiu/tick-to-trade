@@ -84,7 +84,9 @@ the line, the slower the write. I measured this with one core doing a non-tempor
 DRAM: with 1 core polling the line, it took 180 ns from the IOdie write until that core read it;
 with 47 cores polling, the first of them read it after 860 ns and the last after 1,170 ns,
 because the write has to invalidate every core that holds the line, and the more cores hold it,
-the longer it waits for all of them to finish. So a `wait` p50 of 99 ns clearly goes against intuition.
+the longer it waits for all of them to finish. So a `wait` p50 of 99 ns clearly goes against intuition. For `wait`, counting only the latency of the
+IOdie writing the packet buffer and the event queue to DRAM, the p50 is already about 0.5 μs in theory,
+and the whole `wait` should be between 0.5 μs and 2 μs.
 A CPU with DDIO lets the card write straight into L3, which lowers these very high latencies and
 fixes the problem that the IOdie's write leaves no copy in L3.
 
