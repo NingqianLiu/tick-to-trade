@@ -311,8 +311,8 @@ one by one in packet order and in the order of the orders inside each packet.
    the same kind in batches, in parallel (the processing logic is the same, so the code is
    the same, for example processing 16 order cancels at the same time), turning the order
    stream that comes in the sequence A D U X A D U X A D U X into the order stream A A A | U2 U2 U2 | U1 U1 U1 | U2 U2 U2 |
-   U1 U1 U1 | D D D | X X X (except for the second U2 group, each group between the | marks
-   can run out of order), and because the code logic is the same and the orders are independent of each other, I can,
+   U1 U1 U1 | D D D | X X X (except for the second U2 group, the orders inside each group between the
+   `|` marks can run out of order), and because the code logic is the same and the orders are independent of each other, I can,
    by splitting the loops plus out-of-order execution, turn on
    the MLP technique, in the PoolMap lookups, compressing the latency of 8 cache line misses
    into the latency of 1 cache line miss, and so greatly cutting the total latency of cache
