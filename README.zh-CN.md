@@ -1,4 +1,4 @@
-<p align="right"><a href="README.md">English</a> | <b>中文</b></p>
+<p align="left"><a href="README.md">English</a> | <b>中文</b></p>
 
 # 这台机器上的 wire-to-wire
 
@@ -42,9 +42,11 @@
 
 `wait` 和 `send` 是跨两个时钟计时的 (网卡的和 CPU 的), 所以量出来可能偏大或者偏小 —— 这就是为什么 `send` 的 p99.9 和最大值比 `total` 还大, 而 `wait` 的 p50 比 DRAM 的访存延迟 (120 ns) 还小。
 
-`wait` 走的是这条路: 第一个 byte 进入 NIC, 打 NIC 时间戳, 等网卡把整个 frame 收完、查完 CRC, 经 PCIe 用 DMA 写进 CPU 的 IOdie (不经过物理核心), IOdie 再把它写进 DRAM 里的包缓冲。然后网卡为这个包往事件队列里写一条事件, 事件队列也在 DRAM 里。CPU 一直在轮询事件队列, 看到新事件的那一次读要去 DRAM, 读到之后打 CPU 的 rdtsc 时间戳, 这个时间戳和一开始的 NIC 时间戳的差值就是 `wait`。DRAM 访存一个来回实测 120 ns, `wait` 的 p50 却只有 99 ns, 是因为网卡和 CPU 的两个时钟之间有一个时间差, 而且两个时钟的晶振快慢不一样, 这个时间差一直在变。
-
 `fetch`、`work`、`work 1` 到 `work 6` 以及 `total`, 都是在同一个时钟上开始和结束的, 所以这些数是准确的。
+
+`wait` 走的是这条路: 第一个 byte 进入 NIC, 打 NIC 时间戳, 等网卡把整个 frame 收完、查完 CRC, 经 PCIe 用 DMA 写进 CPU 的 IOdie (不经过物理核心), IOdie 再把它写进 DRAM 里的包缓冲。然后网卡为这个包往事件队列里写一条事件, 事件队列也在 DRAM 里。这两次写入 DRAM 的操作都无法在 CPU 的 L3 里留下一份 cache, 因为 AMD Zen 2 的 L3 只能接受从 L2 踢出来的 cacheline。CPU 一直在轮询事件队列, 看到新事件的那一次读要去 DRAM, 读到之后打 CPU 的 rdtsc 时间戳, 这个时间戳和一开始的 NIC 时间戳的差值就是 `wait`。DRAM 访存一个来回实测 120 ns, `wait` 的 p50 却只有 99 ns, 是因为网卡和 CPU 的两个时钟之间有一个时间差, 而且两个时钟的晶振快慢不一样, 这个时间差一直在变。
+
+NIC 通过 IOdie 写入 DRAM 全流程和为什么需要 DDIO: 一个写入请求到达, IOdie 要先让 CPU 里有这条 cacheline 的所有核心把它 invalid, 等所有有这条 cacheline 的核心都回话确认, 这次 DRAM 写才算完成。IOdie 上有一张目录 (directory), 记着哪些核的缓存里有这条 cacheline, 没有核有就直接写。事件队列那条一直在被轮询, 所以在核心一定有, 一定需要 invalid。包缓冲 packet 的 cacheline 只有旧内容还留在缓存里时才要, 而且事件队列的写入要排在包缓冲的写入后面, 所以这段等待包缓冲完成的时间也需要算进 `wait`。拿着这条 cacheline 的核心越多, 这次写就越慢, 我用一个核心做非临时写, 写入 DRAM, 对延迟进行实测: 1 个核心轮询读这条 cacheline 时, 从 IOdie 写入到这 1 个核心读到是 180 ns; 47 个核心轮询读这条 cacheline 时, 从 IOdie 写入到 47 个核心中, 最先读到这条 cacheline 的那 1 个核心的延迟是 860 ns, 最晚读到这条 cacheline 的那 1 个核心的延迟是 1,170 ns, 因为 DRAM 的写入需要 invalid 所有拿着这条 cacheline 的核心, 拿着这条 cacheline 的核心越多, 等待所有核心 invalid 完成的时间就越长。所以这里 `wait` 的 p50 99 ns 明显不符合直觉。而一颗有 DDIO 的 CPU 就可以让网卡直接写入 L3 cache, 来降低这些极高的延迟和解决 IOdie 写完后 L3 没有留下一份 cache 的问题了。
 
 ## 每个版本换来了什么
 
@@ -229,7 +231,7 @@ U: APPL  old_oid 2345 -> new_oid 3456    <- 3456 是这一批最终存活的订�
 
 3. Q: 采用这样的设计的目的是什么?
 
-   A: 这样的设计使得我可以乱序执行交易所发来的订单更新(除了`遍4`之外, 每一遍的执行中, 每个订单之间都没有依赖关系), 从而批量并行处理同一种订单 (因为处理逻辑一致, 所以代码一致, 比如同时处理 16 个撤销订单), 把先后顺序为 A D U X A D U X A D U X 的订单流变成 遍 1: A A A, 遍 2: U2 U2 U2, 遍 3: U1 U1 U1, 遍 4: U2 U2 U2, 遍 5: U1 U1 U1, 遍 6: D D D, 遍 7: X X X 的订单流, 除了遍 4 之外, 都可以乱序, 而代码逻辑一致并且订单之间互相独立, 使得我可以通过分圈 + 乱序, 启用 MLP 技术, 在 PoolMap 的查表中, 把 8 次 cacheline missing 的延迟压缩到 1 次 cacheline missing 的延迟, 从而大幅降低一个批次内 cacheline missing 的总延迟。[实测](#mlp-measured)
+   A: 这样的设计使得我可以乱序执行交易所发来的订单更新(除了`遍4`之外, 每一遍的执行中, 每个订单之间都没有依赖关系), 从而批量并行处理同一种订单 (因为处理逻辑一致, 所以代码一致, 比如同时处理 16 个撤销订单), 把先后顺序为 A D U X A D U X A D U X 的订单流变成 遍 1: A A A, 遍 2: U2 U2 U2, 遍 3: U1 U1 U1, 遍 4: U2 U2 U2, 遍 5: U1 U1 U1, 遍 6: D D D, 遍 7: X X X 的订单流, 除了遍 4 之外, 每一遍内的执行都可以乱序, 而代码逻辑一致并且订单之间互相独立, 使得我可以通过分圈 + 乱序, 启用 MLP 技术, 在 PoolMap 的查表中, 把 8 次 cacheline missing 的延迟压缩到 1 次 cacheline missing 的延迟, 从而大幅降低一个批次内 cacheline missing 的总延迟。[实测](#mlp-measured)
 
 ---
 
@@ -405,7 +407,7 @@ M = min( LFB , W / L , 手上互相独立的 miss 数 )
 
 能做到 130 ns 有两个前提: 这 8 次查找互相不依赖 (后一次的地址不用等前一次的结果), 而且 M 装得下 8 个 (8 小于 Zen 2 的 22 个 MSHR, 循环也短到能让 8 次查找同时待在乱序窗口里)。
 
-<a id="mlp-measured"></a>⭐⭐⭐这台机器上实测: 8 次互相独立、每次都去 DRAM 的访存, 一个接一个要约 1,002 ns (每次约 125 ns), 一起发约 136 ns。⭐⭐⭐
+<a id="mlp-measured"></a>⭐⭐⭐这台机器上实测: 8 次互相独立、每次都去 DRAM 的访存, 从一个接一个发到全部收到, 需要大约 1,002 ns (平均每次约 125 ns), 用 MLP 8 次一起发到全部收到约 136 ns, 略高于单次 DRAM 访存的 120 ns (平均每次约 17 ns)。⭐⭐⭐
 
 ```
 LFB   跟踪 miss 的位置。任何一次 L1 miss 都要占一个, 而一次 DRAM 读占住它的时间

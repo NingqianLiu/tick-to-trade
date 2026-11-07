@@ -1,4 +1,4 @@
-<p align="right"><b>English</b> | <a href="README.zh-CN.md">中文</a></p>
+<p align="left"><b>English</b> | <a href="README.zh-CN.md">中文</a></p>
 
 # Wire-to-wire on this machine
 
@@ -58,18 +58,35 @@ stretch the link stays full for 857 μs on one feed, twice that with both.
 out too big or too small — that is why `send` is above `total` at p99.9 and at the max, and
 why `wait` p50 is below the DRAM access latency (120 ns).
 
+`fetch`, `work`, `work 1` to `work 6` and `total` each start and end on one clock, so
+those numbers are exact.
+
 `wait` covers this path: the first byte enters the NIC and gets the NIC timestamp, the card
 waits to take in the whole frame and checks its CRC, writes it by
 DMA over PCIe into the CPU's IOdie (not through any physical core), and the IOdie writes it to a packet buffer in DRAM.
-Then the card writes one event for that packet into the event queue, also in DRAM. The CPU
+Then the card writes one event for that packet into the event queue, also in DRAM. Neither
+write to DRAM can leave a cached copy in the CPU's L3, because the L3 on AMD Zen 2 only takes
+cachelines evicted from L2. The CPU
 polls the event queue, and the read that sees the new event goes to DRAM. After that read,
 the CPU takes an rdtsc timestamp, and the gap between this timestamp and the NIC timestamp from the start is `wait`. I measured
 one DRAM round trip at 120 ns. `wait` p50 is still only 99 ns, because the card's clock and the
 CPU's clock have an offset between them, and the two clocks' crystals run at slightly different
 speeds, so the offset keeps moving.
 
-`fetch`, `work`, `work 1` to `work 6` and `total` each start and end on one clock, so
-those numbers are exact.
+How the NIC writes to DRAM through the IOdie, and why DDIO is needed: when a write request arrives, the IOdie must first
+have every core that holds that cacheline invalidate it, and the DRAM write only counts as done
+after all of those cores have replied. The IOdie keeps a directory of which cores hold a
+cacheline; if no core holds it, the write goes straight through. The event queue line is always
+being polled, so some core always holds it and it always needs invalidating. The packet buffer
+lines need it only if old contents are still in a cache, and since the event queue write has
+to come after the packet buffer write, that wait also counts in `wait`. The more cores hold
+the line, the slower the write. I measured this with one core doing a non-temporal write to
+DRAM: with 1 core polling the line, it took 180 ns from the IOdie write until that core read it;
+with 47 cores polling, the first of them read it after 860 ns and the last after 1,170 ns,
+because the write has to invalidate every core that holds the line, and the more cores hold it,
+the longer it waits for all of them to finish. So a `wait` p50 of 99 ns clearly goes against intuition.
+A CPU with DDIO lets the card write straight into L3, which lowers these very high latencies and
+fixes the problem that the IOdie's write leaves no copy in L3.
 
 ## What each version bought
 
@@ -293,7 +310,7 @@ one by one in packet order and in the order of the orders inside each packet.
    the same, for example processing 16 order cancels at the same time), turning the order
    stream that comes in the sequence A D U X A D U X A D U X into the order stream pass 1: A A A, pass 2: U2 U2 U2,
    pass 3: U1 U1 U1, pass 4: U2 U2 U2, pass 5: U1 U1 U1, pass 6: D D D, pass 7: X X X
-   (every pass except pass 4 can run out of order), and because the code logic is the same and the orders are independent of each other, I can,
+   (except for pass 4, the work within each pass can run out of order), and because the code logic is the same and the orders are independent of each other, I can,
    by splitting the loops plus out-of-order execution, turn on
    the MLP technique, in the PoolMap lookups, compressing the latency of 8 cache line misses
    into the latency of 1 cache line miss, and so greatly cutting the total latency of cache
@@ -487,8 +504,10 @@ Getting 130 ns needs two things: the 8 lookups do not depend on each other (the 
 does not wait for the previous result), and M has room for 8 (8 is below Zen 2's 22 MSHRs,
 and the loop is short enough that all 8 lookups sit in the out-of-order window at once).
 
-<a id="mlp-measured"></a>⭐⭐⭐ Measured on this machine: 8 independent accesses that each go to DRAM take about 1,002 ns one
-after another (about 125 ns each), and about 136 ns sent together. ⭐⭐⭐
+<a id="mlp-measured"></a>⭐⭐⭐ Measured on this machine: 8 independent accesses that each go to DRAM take about 1,002 ns from
+sending them one after another until all have arrived (about 125 ns each on average), and about
+136 ns from sending all 8 together with MLP until all have arrived, a little more than the 120 ns of
+one DRAM access (about 17 ns each on average). ⭐⭐⭐
 
 ```
 LFB   miss tracking slots. Any L1 miss takes one, and a DRAM read holds it ten
