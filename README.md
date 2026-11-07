@@ -58,12 +58,14 @@ stretch the link stays full for 857 μs on one feed, twice that with both.
 out too big or too small — that is why `send` is above `total` at p99.9 and at the max, and
 why `wait` p50 is below the DRAM access latency (120 ns).
 
-`wait` covers this path: the card takes in the whole frame and checks its CRC, writes it by
+`wait` covers this path: the first byte enters the NIC and gets the NIC timestamp, the card
+waits to take in the whole frame and checks its CRC, writes it by
 DMA over PCIe into the CPU's IOdie (not through any physical core), and the IOdie writes it to a packet buffer in DRAM.
 Then the card writes one event for that packet into the event queue, also in DRAM. The CPU
-polls the event queue, and the read that sees the new event goes to DRAM. I measured one
-DRAM access at 120 ns. `wait` p50 is still only 99 ns, because the card's clock and the
-CPU's clock have an offset between them, and the two crystals run at slightly different
+polls the event queue, and the read that sees the new event goes to DRAM. After that read,
+the CPU takes an rdtsc timestamp, and the gap between this timestamp and the NIC timestamp from the start is `wait`. I measured
+one DRAM round trip at 120 ns. `wait` p50 is still only 99 ns, because the card's clock and the
+CPU's clock have an offset between them, and the two clocks' crystals run at slightly different
 speeds, so the offset keeps moving.
 
 `fetch`, `work`, `work 1` to `work 6` and `total` each start and end on one clock, so
@@ -83,7 +85,7 @@ What v2 did (no code changed):
 
 ![v1 to v2](charts/v1_v2.svg)
 
-1) Kept other work off the reserved cores. An ssh tunnel woke on one every ninety seconds.
+1) Kept other work off the reserved cores.
 2) isolcpus stops the scheduler moving work onto a core. A task allowed to run there can still land on it, and then the scheduler never moves it off.
 3) Stopped reading UEFI variables during a run — one read freezes both sockets for 1.13 ms.
 4) After a freeze the replay catches up at full speed, so a millisecond arrives at once.
